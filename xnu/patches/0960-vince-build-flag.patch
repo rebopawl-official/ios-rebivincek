@@ -1,0 +1,36 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 798f146..9cdcf55 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -63,7 +63,7 @@ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ # topaz: Cortex-A53/A73 are ARMv8.0 (no LSE atomics, RCpc, PAN or FP16). An explicit
+ # -mcpu: -arch arm64 otherwise keeps clang's apple-m1 default and its LSE/RCpc features
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53 $(if $(filter 1,$(TOPAZ_4K)),-DTOPAZ_4K=1)
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53 $(if $(filter 1,$(TOPAZ_4K)),-DTOPAZ_4K=1) $(if $(filter 1,$(VINCE)),-DVINCE=1)
+ 
+ 
+ #
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index cfeb976..3795984 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -57,7 +57,18 @@
+  * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
++#if defined(VINCE)
++/*
++ * vince (Redmi 5 Plus, MSM8953, 8x Cortex-A53, no PAN/LSE): GICv2 (qcom,msm-qgic2),
++ * memory-mapped distributor and CPU interface, one non-secure view per core. Qualcomm
++ * PPI numbering as on the other boards, but the virtual timer is INTID 20 here
++ * (device tree interrupts <1 4 0xf08> and /proc/interrupts of the phone).
++ * Requires TOPAZ_4K=1 (the CPU has no 16 KiB granule).
++ */
++#define SWEET_VTIMER_INTID        20
++#else
+ #define SWEET_VTIMER_INTID        19
++#endif
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt

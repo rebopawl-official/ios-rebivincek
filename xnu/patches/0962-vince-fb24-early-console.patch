@@ -1,0 +1,295 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index b926886..6f327c9 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1832,6 +1832,16 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+  * survives the TTBR0 teardown. Slots in use or no L2 table: no alias.
+  */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++#if defined(VINCE)
++/* vince: 4 blocks from 0x90000000; the 24 bpp buffer starts 0x1000 into the first one */
++#define SWEET_EARLY_FB_PHYS   0x90000000ULL
++#define SWEET_EARLY_FB_BLOCKS 4
++#define SWEET_EARLY_FB_OFFSET 0x1000
++#else
++#define SWEET_EARLY_FB_PHYS   0x5c000000ULL
++#define SWEET_EARLY_FB_BLOCKS 6
++#define SWEET_EARLY_FB_OFFSET 0
++#endif
+ static bool sweet_early_fb_mapped;
+ 
+ static void
+@@ -1844,16 +1854,16 @@ sweet_early_map_final(void)
+ 	}
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	unsigned int first = (unsigned int)((va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+-	if (first + 6 > TTE_PGENTRIES) {
++	if (first + SWEET_EARLY_FB_BLOCKS > TTE_PGENTRIES) {
+ 		return;
+ 	}
+-	for (unsigned int i = 0; i < 6; i++) {
++	for (unsigned int i = 0; i < SWEET_EARLY_FB_BLOCKS; i++) {
+ 		if (l2[first + i] != ARM_TTE_EMPTY) {
+ 			return;
+ 		}
+ 	}
+-	for (unsigned int i = 0; i < 6; i++) {
+-		l2[first + i] = (0x5c000000ULL + i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	for (unsigned int i = 0; i < SWEET_EARLY_FB_BLOCKS; i++) {
++		l2[first + i] = (SWEET_EARLY_FB_PHYS + i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+@@ -2229,7 +2239,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #if defined(SWEET) && defined(TOPAZ_4K)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+ 	if (sweet_early_fb_mapped) {
+-		sweet_early_relocate(SWEET_EARLY_FB_VA);
++		sweet_early_relocate(SWEET_EARLY_FB_VA + SWEET_EARLY_FB_OFFSET);
+ 	} else {
+ 		sweet_early_disable();
+ 	}
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 9fd1cb9..654960e 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,19 +515,34 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-#if defined(TOPAZ_4K)
++#if defined(VINCE)
++	/* vince: 1080x2160 packed 24 bpp, stride 3240, buffer at 0x90001000; bottom rows */
++	MOV64	x0, (0x90001000 + 2128 * 3240)
++#elif defined(TOPAZ_4K)
+ 	MOV64	x0, (0x5c000000 + 2368 * 4320)	/* topaz splash framebuffer */
+ #else
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
+ #endif
+ 	mov		w1, #-1
+ 	mov		x2, #32
++#if defined(VINCE)
++	mov		x4, #3240
++#else
+ 	mov		x4, #4320
++#endif
+ Lsweet_mark_row:
++#if defined(VINCE)
++	mov		x3, #(64 * 3)			/* bytes: 3 per pixel */
++#else
+ 	mov		x3, #64
++#endif
+ 	mov		x5, x0
+ Lsweet_mark_pixel:
++#if defined(VINCE)
++	strb	w1, [x5], #1
++#else
+ 	str		w1, [x5], #4
++#endif
+ 	subs	x3, x3, #1
+ 	b.ne	Lsweet_mark_pixel
+ 	add		x0, x0, x4
+@@ -689,14 +704,23 @@ Lkernelcache_base_found:
+ 	 * RAM is at 0x140000000), for the early screen console.
+ 	 */
+ 	add		x2, x2, PGBYTES
++#if defined(VINCE)
++	/* vince: 0x90000000..0x907fffff (the buffer starts at +0x1000), L1 index 2; RAM is below 0x80000000 */
++	MOV64	x10, 0x90000000
++#else
+ 	MOV64	x10, 0x5c000000
++#endif
+ 	create_l1_table_entry x10, x1, x2, x11, x12, x13
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x2, x12, lsl #(TTE_SHIFT)
++#if defined(VINCE)
++	mov		x12, #4				/* 8 MB covers 1080x2160x3 = 6.7 MB */
++#else
+ 	mov		x12, #6
++#endif
+ Ltopaz_fb_block:
+ 	str		x11, [x13], #(1 << TTE_SHIFT)
+ 	add		x11, x11, #(ARM_TT_L2_SIZE)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 9429767..89acdcd 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,15 +11,27 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-#if defined(TOPAZ_4K)
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x5c000000;  /* topaz splash */
++#if defined(VINCE)
++/* vince: 1080x2160, packed 24 bpp (bytes B,G,R), stride 3240, left lit by LK at 0x90001000 */
++static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)0x90001000;
++#define EARLY_BPP 3u
++#define EARLY_WIDTH 1080u
++#define EARLY_HEIGHT 2160u
++#define EARLY_STRIDE_BYTES 3240u
++#elif defined(TOPAZ_4K)
++static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)0x5c000000;  /* topaz splash */
++#define EARLY_BPP 4u
++#define EARLY_WIDTH 1080u
++#define EARLY_HEIGHT 2400u
++#define EARLY_STRIDE_BYTES 4320u
+ #else
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+-#endif
+-#define EARLY_FB early_fb
++static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)0x9c000000;
++#define EARLY_BPP 4u
+ #define EARLY_WIDTH 1080u
+ #define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_STRIDE_BYTES 4320u
++#endif
++#define EARLY_FB early_fb
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -28,6 +40,20 @@ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ 
+ extern unsigned char iso_font[256 * 16];
+ 
++/* One pixel of a row, as 0xAARRGGBB, in the framebuffer's own format. */
++static inline void
++early_px(volatile uint8_t *row, unsigned int x, uint32_t argb)
++{
++#if EARLY_BPP == 3
++	volatile uint8_t *p = row + x * 3u;
++	p[0] = (uint8_t)argb;
++	p[1] = (uint8_t)(argb >> 8);
++	p[2] = (uint8_t)(argb >> 16);
++#else
++	*(volatile uint32_t *)(row + x * 4u) = argb;
++#endif
++}
++
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+@@ -36,9 +62,9 @@ static void
+ sweet_early_clear_row(void)
+ {
+ 	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
+-		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
++		volatile uint8_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE_BYTES;
+ 		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+-			line[x] = 0xff000000u;
++			early_px(line, x, 0xff000000u);
+ 		}
+ 	}
+ }
+@@ -68,13 +94,13 @@ sweet_early_putc(char c)
+ 	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+ 	for (unsigned int gy = 0; gy < 16; gy++) {
+ 		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+-			volatile uint32_t *line = EARLY_FB +
+-			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+-			    early_col * EARLY_CELL_W;
++			volatile uint8_t *line = EARLY_FB +
++			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE_BYTES +
++			    early_col * EARLY_CELL_W * EARLY_BPP;
+ 			for (unsigned int gx = 0; gx < 8; gx++) {
+ 				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+ 				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+-					line[gx * EARLY_SCALE + sx] = pixel;
++					early_px(line, gx * EARLY_SCALE + sx, pixel);
+ 				}
+ 			}
+ 		}
+@@ -99,7 +125,7 @@ sweet_early_mark(unsigned int stage, const char *label)
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+ 	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+ 		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
++			early_px(EARLY_FB + y * EARLY_STRIDE_BYTES, x, color);
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -133,7 +159,7 @@ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_fb = (volatile uint8_t *)(uintptr_t)base;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..74f1253 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -716,18 +716,37 @@ extern unsigned char iso_font[256 * 16];
+ #define FBCON_SCALE     2
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
++#if defined(VINCE)
++/* vince: packed 24 bpp (bytes B,G,R) */
++#define FBCON_BPP       3u
++#else
++#define FBCON_BPP       4u
++#endif
+ 
+-static volatile uint32_t *fbcon_base;
++static volatile uint8_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
++static inline void
++fbcon_px(volatile uint8_t *row, uint32_t x, uint32_t argb)
++{
++#if defined(VINCE)
++	volatile uint8_t *p = row + x * 3u;
++	p[0] = (uint8_t)argb;
++	p[1] = (uint8_t)(argb >> 8);
++	p[2] = (uint8_t)(argb >> 16);
++#else
++	*(volatile uint32_t *)(row + x * 4u) = argb;
++#endif
++}
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
+ 	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
+-		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
++		volatile uint8_t *line = fbcon_base + y * fbcon_stride;
+ 		for (uint32_t x = 0; x < fbcon_width; x++) {
+-			line[x] = FBCON_BG;
++			fbcon_px(line, x, FBCON_BG);
+ 		}
+ 	}
+ }
+@@ -776,11 +795,11 @@ fbcon_transmit_data(uint8_t c)
+ 	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
+ 	for (uint32_t gy = 0; gy < 16; gy++) {
+ 		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
+-			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			volatile uint8_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * fbcon_stride + x0 * FBCON_BPP;
+ 			for (uint32_t gx = 0; gx < 8; gx++) {
+ 				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
+ 				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
+-					line[gx * FBCON_SCALE + sx] = px;
++					fbcon_px(line, gx * FBCON_SCALE + sx, px);
+ 				}
+ 			}
+ 		}
+@@ -831,11 +850,11 @@ fbcon_probe(void)
+ 	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_stride = *val;
+ 	}
+-	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * FBCON_BPP) {
+ 		return;
+ 	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+-	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);
