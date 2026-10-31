@@ -2,4 +2,5 @@
 kernel already booted yaay.
 but for now its all.
 99.7% of work done by claude....... yeah...
-
+At least I'm being honest....
+ya shouldn't test it for now, please 
