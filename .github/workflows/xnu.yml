@@ -16,7 +16,7 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    branches: [main, vince]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -32,6 +32,10 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # vince (Redmi 5 Plus): Cortex-A53 has no 16 KiB granule, so 4 KiB pages (TOPAZ_4K) plus the VINCE board
+  # variant (GICv2, 24 bpp console, boot CPU 0). Both are read by makedefs/MakeInc.def.
+  TOPAZ_4K: "1"
+  VINCE: "1"
   # ccache: xnu is ~2000 compiles; a patch usually changes a few of them
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_BASEDIR: ${{ github.workspace }}
@@ -104,6 +108,16 @@ jobs:
           ccache -z
           bash build.sh
           ccache -s
+
+      - name: Check that the vince patches were applied
+        if: always()
+        run: |
+          # dxb applies patches with `git apply` and skips a failing one silently: a kernel built without
+          # them would boot-loop on the phone for no visible reason, so fail loudly instead.
+          for f in makedefs/MakeInc.def pexpert/arm/pe_fiq.c osfmk/arm64/sweet_early.c osfmk/arm64/sleh.c iokit/Kernel/arm/SweetCPU.cpp pexpert/arm/pe_serial.c osfmk/arm64/start.s osfmk/arm64/arm_vm_init.c pexpert/pexpert/arm64/SWEET.h; do
+            if grep -q VINCE "dxb/xnu/$f"; then echo "ok   $f"; else echo "MISSING vince patch in $f"; missing=1; fi
+          done
+          [ -z "${missing:-}" ]
 
       - name: Package build tree for local compiles
         if: always()
