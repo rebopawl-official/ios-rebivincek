@@ -1,0 +1,454 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 0f71f63..de6c9d8 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -78,7 +78,7 @@ IOKitInitializeTime( void )
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+-#ifndef BCM2837
++#if !defined(BCM2837) && !defined(VINCE)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index c513fe3..b2e14ec 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1949,14 +1949,21 @@ sleh_irq(arm_saved_state_t *state)
+ #if defined(VINCE)
+ 	uint64_t iar = sweet_gic_ack();
+ 	uint32_t intid = (uint32_t)(iar & 0x3FF);
++	vince_irq_stat[4] = intid;
+ #else
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ #endif
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
++#if defined(VINCE)
++		vince_irq_stat[3]++;
++#endif
+ 		return; /* spurious */
+ 	}
++#if defined(VINCE)
++	vince_irq_stat[(intid == sweet_vtimer_intid) ? 0 : (intid < 16) ? 1 : 2]++;
++#endif
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+diff --git a/osfmk/arm64/vince_diag.c b/osfmk/arm64/vince_diag.c
+new file mode 100644
+index 0000000..74e7c0b
+--- /dev/null
++++ b/osfmk/arm64/vince_diag.c
+@@ -0,0 +1,328 @@
++/*
++ * vince (Redmi 5 Plus) bring-up diagnostics. Nothing here runs on other boards.
++ *
++ * The screen is the only output channel, so this answers "what is the kernel
++ * doing" on screen: a thread that never sleeps on a timer prints
++ *   - a heartbeat line every 3 s with the uptime and the interrupt counters,
++ *   - at 8 s, 24 s and 60 s a dump of the GIC/timer registers and of every
++ *     kernel thread (state and a symbolised backtrace of what it is blocked on).
++ * Symbols come from the kernel's own Mach-O symbol table (boot-arg keepsyms=1
++ * keeps __LINKEDIT mapped); without it raw addresses are printed.
++ *
++ * Boot-arg vincediag=0 turns it off.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(VINCE)
++
++#include <stdint.h>
++#include <string.h>
++#include <mach/mach_types.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++#include <kern/kern_types.h>
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/queue.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/misc_protos.h>
++#include <mach-o/loader.h>
++#include <mach-o/nlist.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm/protos.h>
++#include <machine/machine_routines.h>
++
++/* [0] vtimer IRQs, [1] IPIs (SGI), [2] other IRQs, [3] spurious, [4] last INTID (sleh_irq) */
++volatile uint32_t vince_irq_stat[8];
++
++extern struct mach_header_64 _mh_execute_header;
++
++#define VD_MAX_THREADS  96
++#define VD_MAX_FRAMES   14
++
++static const struct nlist_64 *vd_nl;
++static uint32_t vd_nn;
++static const char *vd_str;
++static boolean_t vd_syms_ok;
++
++static boolean_t
++vd_readable(uint64_t addr, uint64_t len)
++{
++	uint64_t scratch;
++
++	/* ml_nofault_copy() refuses unmapped addresses instead of faulting */
++	for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
++		if (ml_nofault_copy((vm_offset_t)(addr + off), (vm_offset_t)&scratch, 1) != 1) {
++			return FALSE;
++		}
++	}
++	return ml_nofault_copy((vm_offset_t)(addr + len - 1), (vm_offset_t)&scratch, 1) == 1;
++}
++
++static void
++vd_syms_init(void)
++{
++	const struct mach_header_64 *mh = &_mh_execute_header;
++	const struct load_command *lc;
++	const struct symtab_command *st = NULL;
++	const struct segment_command_64 *le = NULL;
++	int keepsyms = 0;
++
++	if (!PE_parse_boot_argn("keepsyms", &keepsyms, sizeof(keepsyms)) || mh->magic != MH_MAGIC_64 || mh->ncmds > 256) {
++		return;
++	}
++	lc = (const struct load_command *)(mh + 1);
++	for (uint32_t i = 0; i < mh->ncmds; i++) {
++		if (lc->cmdsize < sizeof(*lc)) {
++			return;
++		}
++		if (lc->cmd == LC_SYMTAB) {
++			st = (const struct symtab_command *)lc;
++		} else if (lc->cmd == LC_SEGMENT_64) {
++			const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
++			if (strncmp(sg->segname, "__LINKEDIT", 16) == 0) {
++				le = sg;
++			}
++		}
++		lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
++	}
++	if (st == NULL || le == NULL || st->nsyms == 0) {
++		return;
++	}
++	/* virtual address of file offset 0 of the linkedit data (the kernel is not slid on this port) */
++	uint64_t base = (le->vmaddr + vm_kernel_slide) - le->fileoff;
++	uint64_t syms = base + st->symoff;
++	uint64_t strs = base + st->stroff;
++	if (!vd_readable(syms, (uint64_t)st->nsyms * sizeof(struct nlist_64)) || !vd_readable(strs, st->strsize)) {
++		return;
++	}
++	vd_nl = (const struct nlist_64 *)syms;
++	vd_nn = st->nsyms;
++	vd_str = (const char *)strs;
++	vd_syms_ok = TRUE;
++}
++
++/* Nearest preceding symbol of a kernel address; returns NULL when unknown. */
++static const char *
++vd_lookup(uint64_t addr, uint64_t *off)
++{
++	const struct nlist_64 *best = NULL;
++
++	if (!vd_syms_ok) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i < vd_nn; i++) {
++		const struct nlist_64 *n = &vd_nl[i];
++		if ((n->n_type & N_STAB) || (n->n_type & N_TYPE) != N_SECT || n->n_un.n_strx == 0) {
++			continue;
++		}
++		if (n->n_value <= addr && (best == NULL || n->n_value > best->n_value)) {
++			best = n;
++		}
++	}
++	if (best == NULL || addr - best->n_value > 0x100000) {
++		return NULL;
++	}
++	*off = addr - best->n_value;
++	return vd_str + best->n_un.n_strx;
++}
++
++/* Short printable name: leading '_' and mangling prefix dropped, cut to `max` characters. */
++static void
++vd_name(char *out, size_t outsz, uint64_t addr, unsigned int max)
++{
++	uint64_t off = 0;
++	const char *nm = vd_lookup(addr, &off);
++
++	if (nm == NULL) {
++		snprintf(out, outsz, "%llx", (unsigned long long)addr);
++		return;
++	}
++	if (*nm == '_') {
++		nm++;
++	}
++	if (strncmp(nm, "_ZN", 3) == 0) {
++		nm += 3;
++	}
++	size_t n = strnlen(nm, 200);
++	if (n > max) {
++		n = max;
++	}
++	if (n > outsz - 1) {
++		n = outsz - 1;
++	}
++	memcpy(out, nm, n);
++	out[n] = '\0';
++}
++
++static boolean_t
++vd_is_sched_frame(uint64_t addr)
++{
++	static const char *const skip[] = {
++		"machine_switch_context", "thread_invoke", "thread_block", "Switch_context", "thread_run",
++		"thread_dispatch", "lck_mtx_sleep", "lck_sleep", "lck_spin_sleep", "thread_sleep",
++		"IOLockSleep", "waitq_", "sched_", "ast_taken", NULL
++	};
++	uint64_t off;
++	const char *nm = vd_lookup(addr, &off);
++
++	if (nm == NULL) {
++		return FALSE;
++	}
++	if (*nm == '_') {
++		nm++;
++	}
++	for (int i = 0; skip[i] != NULL; i++) {
++		if (strncmp(nm, skip[i], strlen(skip[i])) == 0) {
++			return TRUE;
++		}
++	}
++	return FALSE;
++}
++
++/* Return addresses of a thread that is switched out, from its saved kernel context. */
++static unsigned int
++vd_backtrace(thread_t th, uint64_t *out, unsigned int max)
++{
++	unsigned int n = 0;
++	uint64_t lo = (uint64_t)th->kernel_stack;
++	uint64_t hi = lo + (uint64_t)kernel_stack_size;
++	uint64_t ctx = (uint64_t)th->machine.kstackptr;
++
++	if (lo == 0 || th->continuation != NULL || ctx < lo || ctx + sizeof(arm_kernel_context_t) > hi) {
++		return 0;
++	}
++	const arm_kernel_context_t *kc = (const arm_kernel_context_t *)ctx;
++	uint64_t fp = kc->ss.fp;
++	out[n++] = kc->ss.lr;
++	while (n < max && fp >= lo && fp + 16 <= hi && (fp & 0xf) == 0) {
++		uint64_t frame[2];
++		if (ml_nofault_copy((vm_offset_t)fp, (vm_offset_t)frame, sizeof(frame)) != sizeof(frame) || frame[1] == 0) {
++			break;
++		}
++		out[n++] = frame[1];
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	return n;
++}
++
++static void
++vd_dump_threads(void)
++{
++	thread_t list[VD_MAX_THREADS];
++	unsigned int count = 0, total = 0;
++	thread_t th;
++
++	task_lock(kernel_task);
++	queue_iterate(&kernel_task->threads, th, thread_t, task_threads) {
++		total++;
++		if (count < VD_MAX_THREADS) {
++			list[count++] = th;
++		}
++	}
++	task_unlock(kernel_task);
++
++	unsigned int waiting = 0, runnable = 0;
++	for (unsigned int i = 0; i < count; i++) {
++		th = list[i];
++		int state = th->state;
++		char sc = (state & TH_IDLE) ? 'I' : (state & TH_WAIT) ? ((state & TH_UNINT) ? 'U' : 'W') : (state & TH_RUN) ? 'R' : '?';
++		if (th == current_thread() || (state & TH_IDLE)) {
++			continue;
++		}
++		if (sc == 'W' || sc == 'U') {
++			waiting++;
++		} else {
++			runnable++;
++		}
++
++		uint64_t bt[VD_MAX_FRAMES];
++		unsigned int nbt = vd_backtrace(th, bt, VD_MAX_FRAMES);
++		char a[40], b[40], c[40];
++		unsigned int shown = 0;
++		a[0] = b[0] = c[0] = '\0';
++		for (unsigned int k = 0; k < nbt && shown < 3; k++) {
++			if (vd_syms_ok && shown == 0 && vd_is_sched_frame(bt[k])) {
++				continue;
++			}
++			vd_name(shown == 0 ? a : shown == 1 ? b : c, 40, bt[k], 26);
++			shown++;
++		}
++		if (nbt == 0) {
++			/* blocked with a continuation: the stack is gone, the continuation says what it is */
++			vd_name(a, 40, (uint64_t)(uintptr_t)th->continuation, 26);
++			printf("%llu %c cont %s\n", (unsigned long long)th->thread_id, sc, a);
++		} else {
++			printf("%llu %c %s<%s<%s\n", (unsigned long long)th->thread_id, sc, a, b, c);
++		}
++	}
++	printf("VDIAG threads=%u (listed %u) waiting=%u runnable=%u\n", total, count, waiting, runnable);
++}
++
++static void
++vd_irq_line(unsigned int sec)
++{
++	printf("VDIAG t=%us irq: vtimer=%u ipi=%u other=%u spur=%u last=%u\n", sec,
++	    vince_irq_stat[0], vince_irq_stat[1], vince_irq_stat[2], vince_irq_stat[3], vince_irq_stat[4]);
++}
++
++static void
++vd_timer_line(void)
++{
++	uint64_t ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
++	uint64_t cval = __builtin_arm_rsr64("CNTV_CVAL_EL0");
++	uint64_t now = ml_get_timebase();
++
++	printf("VDIAG CNTV ctl=%llx cval-now=%lld freq=%llu ints_on=%d\n", (unsigned long long)ctl,
++	    (long long)(cval - now), (unsigned long long)gPEClockFrequencyInfo.timebase_frequency_hz,
++	    (int)ml_get_interrupts_enabled());
++}
++
++static void
++vd_thread(void *param __unused, wait_result_t wr __unused)
++{
++	static const unsigned int dump_at[] = { 8, 24, 60 };
++	uint64_t t0 = mach_absolute_time();
++	unsigned int dumped = 0, next_beat = 3;
++
++	vd_syms_init();
++	printf("VDIAG start: symbols %s (%u)\n", vd_syms_ok ? "ok" : "none", vd_nn);
++	for (;;) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		unsigned int s = (unsigned int)(ns / NSEC_PER_SEC);
++
++		if (dumped < sizeof(dump_at) / sizeof(dump_at[0]) && s >= dump_at[dumped]) {
++			dumped++;
++			vince_gic_dump();
++			vd_timer_line();
++			vd_dump_threads();
++			vd_irq_line(s);
++		} else if (s >= next_beat) {
++			next_beat = s + 3;
++			vd_irq_line(s);
++		}
++		/* let anything runnable go first; never sleeps, so it needs no timer interrupt */
++		thread_yield_internal(1);
++	}
++}
++
++void
++vince_diag_start(void)
++{
++	int off = 1;
++	thread_t th;
++
++	if (PE_parse_boot_argn("vincediag", &off, sizeof(off)) && off == 0) {
++		return;
++	}
++	if (kernel_thread_start(vd_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++
++#endif /* VINCE */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..c793cb1 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/vince_diag.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 78253eb..e5b7a31 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -15,6 +15,7 @@
+ 
+ #if HAS_GIC_V3
+ #if defined(VINCE)
++#include <kern/misc_protos.h>
+ /*
+  * vince (Redmi 5 Plus, MSM8953): GICv2 (qcom,msm-qgic2). There are no redistributors
+  * and no ICC_* system registers: the distributor (GICD) and the per-CPU interface
+@@ -159,6 +160,24 @@ pe_init_fiq()
+ 	__builtin_arm_dsb(DSB_SY);
+ 	__builtin_arm_isb(ISB_SY);
+ }
++
++/* Registers that decide whether the virtual timer interrupt can reach this CPU (read only). */
++void
++vince_gic_dump(void)
++{
++	if (!gicd_base || !gicc_base) {
++		printf("VDIAG GIC not mapped\n");
++		return;
++	}
++	unsigned int v = sweet_vtimer_intid;
++	printf("VDIAG GICD ctlr=%x grp0=%x isen0=%x pend0=%x act0=%x pri=%x\n",
++	    v2_read32(gicd_base + V2D_CTLR), v2_read32(gicd_base + 0x080), v2_read32(gicd_base + V2D_ISENABLER0),
++	    v2_read32(gicd_base + 0x200), v2_read32(gicd_base + 0x300),
++	    v2_read32(gicd_base + V2D_IPRIORITYR + (v & ~3U)));
++	printf("VDIAG GICC ctlr=%x pmr=%x bpr=%x rpr=%x hppir=%x vtimer=%u\n",
++	    v2_read32(gicc_base + V2C_CTLR), v2_read32(gicc_base + V2C_PMR), v2_read32(gicc_base + 0x08),
++	    v2_read32(gicc_base + 0x14), v2_read32(gicc_base + 0x18), v);
++}
+ #else /* !VINCE */
+ #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
+ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS, MACHINE_TIMEOUT_UNIT_NSEC, NULL);
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 04dda53..1eabe5b 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -379,6 +379,12 @@ PE_lockdown_iokit(void)
+ 	 * hardware protections.
+ 	 */
+ 	zalloc_iokit_lockdown();
++#if defined(VINCE)
++	{
++		extern void vince_diag_start(void);
++		vince_diag_start();
++	}
++#endif
+ 	StartIOKitMatching();
+ }
+ 
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 4fa6158..b44fa4e 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -43,6 +43,10 @@ extern uint32_t sweet_vtimer_intid;
+ uint32_t sweet_gic_ack(void);
+ void sweet_gic_eoi(uint32_t iar);
+ void sweet_gic_send_sgi(unsigned int target_cpu, unsigned int sgi);
++/* bring-up diagnostics (osfmk/arm64/vince_diag.c, pexpert/arm/pe_fiq.c) */
++extern volatile uint32_t vince_irq_stat[8];
++void vince_diag_start(void);
++void vince_gic_dump(void);
+ #endif
+ #endif
+ 
