@@ -1,0 +1,104 @@
+diff --git a/bsd/dev/vince_emmc.c b/bsd/dev/vince_emmc.c
+index bb27d8d..b54e12a 100644
+--- a/bsd/dev/vince_emmc.c
++++ b/bsd/dev/vince_emmc.c
+@@ -19,7 +19,9 @@
+  *
+  * Other boot-args: emmclist=1 prints the whole partition table, emmcpio=1 uses programmed IO instead
+  * of ADMA, emmcselftest=0 skips the self-test and speed measurement, emmchold=N waits N seconds
+- * after the report (so that the screen can be photographed before a failing root mount ends it).
++ * after the report (so that the screen can be photographed before a failing root mount ends it),
++ * emmcwritetest=1 (with emmcrw=1) checks the write path on the last 4 KiB of the selected partition and
++ * puts the original data back (refused on "userdata" unless emmcwritetest=2).
+  */
+ #if defined(VINCE)
+ #include <sys/param.h>
+@@ -653,11 +655,63 @@ static const struct cdevsw vince_emmc_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++/*
++ * Write path check, non-destructive: save the last 8 sectors of the selected partition, write a pattern
++ * that differs from the old data in every byte (one sector with CMD24, then eight with CMD25 and the
++ * automatic stop), read it back, then write the old data back and read that back too.
++ */
++static void
++ve_writetest(void)
++{
++	static uint8_t saved[8 * EMMC_BLK];
++	uint8_t *b = ve.e.bounce;
++	uint64_t lba = ve.first + ve.nsect - 8;
++	bool ok1 = false, ok8 = false, okr = false;
++	int r;
++
++	lck_mtx_lock(&vince_emmc_lock);
++	r = ve_xfer(lba, 8, false);
++	if (r == 0) {
++		memcpy(saved, b, sizeof(saved));
++		/* one sector, CMD24 */
++		for (unsigned i = 0; i < EMMC_BLK; i++) {
++			b[i] = (uint8_t)((i * 131u + 17u) ^ saved[i] ^ 0xffu);
++		}
++		r = ve_write_sectors(lba, 1);
++		if (r == 0 && ve_xfer(lba, 1, false) == 0) {
++			ok1 = true;
++			for (unsigned i = 0; i < EMMC_BLK; i++) {
++				ok1 = ok1 && b[i] == (uint8_t)((i * 131u + 17u) ^ saved[i] ^ 0xffu);
++			}
++		}
++		/* eight sectors, CMD25 */
++		for (unsigned i = 0; i < sizeof(saved); i++) {
++			b[i] = (uint8_t)((i * 131u + 17u) ^ saved[i] ^ 0xffu);
++		}
++		r = ve_write_sectors(lba, 8);
++		if (r == 0 && ve_xfer(lba, 8, false) == 0) {
++			ok8 = true;
++			for (unsigned i = 0; i < sizeof(saved); i++) {
++				ok8 = ok8 && b[i] == (uint8_t)((i * 131u + 17u) ^ saved[i] ^ 0xffu);
++			}
++		}
++		/* the old data back, whatever happened above */
++		memcpy(b, saved, sizeof(saved));
++		r = ve_write_sectors(lba, 8);
++		if (r == 0 && ve_xfer(lba, 8, false) == 0) {
++			okr = memcmp(b, saved, sizeof(saved)) == 0;
++		}
++	}
++	lck_mtx_unlock(&vince_emmc_lock);
++	printf("VINCE EMMC: write test at LBA %llu: 1 sector %s, 8 sectors %s, original restored %s\n",
++	    (unsigned long long)lba, ok1 ? "ok" : "FAILED", ok8 ? "ok" : "FAILED", okr ? "yes" : "NO");
++}
++
+ static int
+ vince_emmc_init(void)
+ {
+ 	char want[64] = "userdata";
+-	uint32_t rw = 0, show_all = 0, pio = 0, selftest = 1;
++	uint32_t rw = 0, show_all = 0, pio = 0, selftest = 1, wtest = 0;
+ 	int error;
+ 
+ 	PE_parse_boot_argn("emmcroot", want, sizeof(want));
+@@ -665,6 +719,7 @@ vince_emmc_init(void)
+ 	PE_parse_boot_argn("emmclist", &show_all, sizeof(show_all));
+ 	PE_parse_boot_argn("emmcpio", &pio, sizeof(pio));
+ 	PE_parse_boot_argn("emmcselftest", &selftest, sizeof(selftest));
++	PE_parse_boot_argn("emmcwritetest", &wtest, sizeof(wtest));
+ 		ve.pio = (pio == 1);
+ 
+ 	printf("VINCE EMMC: start (root partition \"%s\", %s)\n", want, ve.pio ? "PIO" : "ADMA");
+@@ -750,6 +805,15 @@ vince_emmc_init(void)
+ 			printf("VINCE EMMC: emmcrw=1 ignored: GPT not sound or partition overlaps it\n");
+ 		}
+ 	}
++	if (wtest != 0) {
++		if (!ve.writable) {
++			printf("VINCE EMMC: write test needs emmcrw=1 and a sound GPT\n");
++		} else if (strcmp(ve.name, "userdata") == 0 && wtest != 2) {
++			printf("VINCE EMMC: write test refused on \"userdata\" (emmcwritetest=2 allows it)\n");
++		} else {
++			ve_writetest();
++		}
++	}
+ 	ve.ready = true;
+ 	printf("VINCE EMMC: emmcroot0 ready, %s\n", ve.writable ? "READ-WRITE" : "read-only");
+ 	return 0;
