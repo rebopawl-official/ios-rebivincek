@@ -384,14 +384,14 @@ index b0dad49..c793cb1 100644
  osfmk/arm/io_map.c		standard
  osfmk/arm64/loose_ends.c	standard
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 78253eb..e5b7a31 100644
+index 78253eb..c8b141e 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -15,6 +15,7 @@
  
  #if HAS_GIC_V3
  #if defined(VINCE)
-+#include <kern/misc_protos.h>
++extern int printf(const char *format, ...) __printflike(1, 2);
  /*
   * vince (Redmi 5 Plus, MSM8953): GICv2 (qcom,msm-qgic2). There are no redistributors
   * and no ICC_* system registers: the distributor (GICD) and the per-CPU interface
