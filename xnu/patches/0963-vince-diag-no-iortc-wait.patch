@@ -384,18 +384,10 @@ index b0dad49..c793cb1 100644
  osfmk/arm/io_map.c		standard
  osfmk/arm64/loose_ends.c	standard
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 78253eb..c8b141e 100644
+index 78253eb..d67c0ea 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -15,6 +15,7 @@
- 
- #if HAS_GIC_V3
- #if defined(VINCE)
-+extern int printf(const char *format, ...) __printflike(1, 2);
- /*
-  * vince (Redmi 5 Plus, MSM8953): GICv2 (qcom,msm-qgic2). There are no redistributors
-  * and no ICC_* system registers: the distributor (GICD) and the per-CPU interface
-@@ -159,6 +160,24 @@ pe_init_fiq()
+@@ -159,6 +159,24 @@ pe_init_fiq()
  	__builtin_arm_dsb(DSB_SY);
  	__builtin_arm_isb(ISB_SY);
  }
