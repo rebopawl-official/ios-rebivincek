@@ -1,0 +1,22 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..17ada48 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -77,11 +77,17 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
++#if !defined(VINCE)
++    /*
++     * vince: SweetBattery pokes SM6225 clock/I2C/cpufreq registers; on MSM8953 those addresses
++     * hang the bus (no output, then a reset ~30 s later).
++     */
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
