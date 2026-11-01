@@ -1,0 +1,1641 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c2864ab..154adcd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/vince_emmc_hw.c		standard
++bsd/dev/vince_emmc.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/vince_emmc.c b/bsd/dev/vince_emmc.c
+new file mode 100644
+index 0000000..bb27d8d
+--- /dev/null
++++ b/bsd/dev/vince_emmc.c
+@@ -0,0 +1,779 @@
++/*
++ * vince (Redmi 5 Plus, MSM8953) internal eMMC as a BSD disk.
++ *
++ * The eMMC is a Qualcomm sdhci-msm host (SDHCI registers at 0x07824900, Qualcomm core registers at
++ * 0x07824000). Nothing of what the bootloader left behind is reused: bsd/dev/vince_emmc_hw.c brings
++ * the controller and the card up from scratch in the order the Linux driver uses (this is the code
++ * that was proven on the phone in the bare-metal probe m3a4: vendor-spec 0xa9c, HC mode, power
++ * handshake, SD clock from the clock controller, CMD0/1/2/3/7, 8-bit bus, 19.2 MHz SDR, ~17 MB/s).
++ * Everything is polled, one request at a time, through one physically contiguous allocation
++ * (ADMA2 descriptors and a 1 MiB bounce buffer below 4 GiB). The host is not cache coherent, so the
++ * caches are cleaned/invalidated around each transfer.
++ *
++ * One GPT partition (boot-arg emmcroot=, default "userdata") is exposed as the BSD disk emmcroot0
++ * (remmcroot0), 512-byte sectors. Root on it with rd=emmcroot0. Same shape as bsd/dev/sweet_ufs.c.
++ *
++ * Writes are refused unless boot-arg emmcrw=1 is set, the GPT checks out (both CRCs) and the
++ * partition lies between the GPT copies. Every write is checked against the partition bounds again
++ * right before it is issued.
++ *
++ * Other boot-args: emmclist=1 prints the whole partition table, emmcpio=1 uses programmed IO instead
++ * of ADMA, emmcselftest=0 skips the self-test and speed measurement, emmchold=N waits N seconds
++ * after the report (so that the screen can be photographed before a failing root mount ends it).
++ */
++#if defined(VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++#include "vince_emmc_hw.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++int vince_emmc_rootdev(dev_t *dev);
++
++#define VE_CORE_PA      0x07824000ull   /* Qualcomm SDCC core; the SDHCI block is core + 0x900 */
++#define VE_HC_OFF       0x900u
++#define VE_GCC_PA       0x01842000ull   /* page of the SDCC1 root clock generator and gates */
++#define VE_RCG          0x004u          /* CMD_RCGR (0x1842004); CFG +4, M +8, N +0xc, D +0x10 */
++#define VE_MAP_SIZE     0x1000ull
++
++#define VE_DMA_ADMA     0x0000u         /* EMMC_ADMA_NDESC * 8 bytes */
++#define VE_DMA_BOUNCE   0x1000u         /* page aligned */
++#define VE_DMA_SIZE     (VE_DMA_BOUNCE + EMMC_BOUNCE)
++
++#define VE_GPT_MAX_ENT  4096u
++
++static struct {
++	struct emmc e;
++	vm_offset_t core;               /* kernel VA of the SDCC core registers */
++	vm_offset_t gcc;                /* kernel VA of the clock controller page */
++	vm_offset_t dma;                /* kernel VA of the DMA allocation */
++	uint64_t dma_pa;
++	uint64_t first, nsect;          /* partition, in 512-byte sectors */
++	uint64_t gpt_alt;               /* backup GPT header LBA */
++	uint64_t disk_sects;            /* from EXT_CSD SEC_COUNT */
++	uint32_t secsize;               /* logical sector size for the BSD layer */
++	bool writable;
++	bool pio;
++	bool gpt_ok;                    /* both CRCs matched */
++	bool ready;
++	int bmajor, cmajor;
++	dev_t bdev;
++	char name[37];
++} ve;
++
++static LCK_GRP_DECLARE(vince_emmc_grp, "vince_emmc");
++static LCK_MTX_DECLARE(vince_emmc_lock, &vince_emmc_grp);
++
++/* ---- environment for the transport (struct emmc_ops) ---- */
++
++static void
++ve_dsb(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++ve_rd32(struct emmc *e, uint32_t off)
++{
++	return *(volatile uint32_t *)((uintptr_t)e->priv + off);
++}
++
++static uint16_t
++ve_rd16(struct emmc *e, uint32_t off)
++{
++	return *(volatile uint16_t *)((uintptr_t)e->priv + off);
++}
++
++static uint8_t
++ve_rd8(struct emmc *e, uint32_t off)
++{
++	return *(volatile uint8_t *)((uintptr_t)e->priv + off);
++}
++
++static void
++ve_wr32(struct emmc *e, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)((uintptr_t)e->priv + off) = v;
++	ve_dsb();
++}
++
++static void
++ve_wr16(struct emmc *e, uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)((uintptr_t)e->priv + off) = v;
++	ve_dsb();
++}
++
++static void
++ve_wr8(struct emmc *e, uint32_t off, uint8_t v)
++{
++	*(volatile uint8_t *)((uintptr_t)e->priv + off) = v;
++	ve_dsb();
++}
++
++static uint32_t
++ve_crd(__unused struct emmc *e, uint32_t off)
++{
++	return *(volatile uint32_t *)(ve.core + off);
++}
++
++static void
++ve_cwr(__unused struct emmc *e, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ve.core + off) = v;
++	ve_dsb();
++}
++
++static uint64_t
++ve_us(__unused struct emmc *e)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++ve_clean(__unused struct emmc *e, void *va, uint64_t len)
++{
++	clean_dcache64((addr64_t)(ve.dma_pa + ((vm_offset_t)va - ve.dma)), (unsigned)len, TRUE);
++}
++
++static void
++ve_inval(__unused struct emmc *e, void *va, uint64_t len)
++{
++	flush_dcache64((addr64_t)(ve.dma_pa + ((vm_offset_t)va - ve.dma)), (unsigned)len, TRUE);
++}
++
++/*
++ * The SDCC1 clock is set by the clock controller (root clock generator sdcc1_apps_clk_src), same
++ * register encoding as the Linux gcc-msm8953 driver. Only the 19.2 MHz crystal is used as the
++ * source, so no PLL has to be running: 400 kHz = XO / 12 * 1/4 (dual edge), 19.2 MHz = XO / 1.
++ */
++static int
++ve_set_hz(struct emmc *e, uint32_t hz)
++{
++	volatile uint32_t *r = (volatile uint32_t *)(ve.gcc + VE_RCG);
++	uint32_t cfg = r[1];
++	uint64_t t0 = ve_us(e);
++
++	cfg &= ~(0x1fu | (7u << 8) | (3u << 12));
++	if (hz <= 400000) {
++		r[2] = 1;               /* M */
++		r[3] = 0xfc;            /* ~(N - M) */
++		r[4] = 0xfb;            /* ~D (50% duty) */
++		cfg |= 23u | (2u << 12);
++	} else {
++		cfg |= 1u;
++	}
++	r[1] = cfg;
++	ve_dsb();
++	r[0] = r[0] | 1u;       /* UPDATE */
++	ve_dsb();
++	while (r[0] & 1u) {
++		if (ve_us(e) - t0 > 5000) {
++			return -1;
++		}
++	}
++	return 0;
++}
++
++static const struct emmc_ops ve_ops = {
++	.rd32 = ve_rd32,
++	.rd16 = ve_rd16,
++	.rd8 = ve_rd8,
++	.wr32 = ve_wr32,
++	.wr16 = ve_wr16,
++	.wr8 = ve_wr8,
++	.us = ve_us,
++	.clean = ve_clean,
++	.inval = ve_inval,
++	.crd = ve_crd,
++	.cwr = ve_cwr,
++	.delay_us = NULL,
++	.set_hz = ve_set_hz,
++};
++
++/* ---- bring-up and transfers ---- */
++
++static void
++ve_report_failure(const char *what)
++{
++	struct emmc *e = &ve.e;
++
++	printf("VINCE EMMC: %s failed: log=%s err=%s cmd%u int=%x adma=%x ps=%x resp=%x\n", what,
++	    e->init_log, e->err_what ? e->err_what : "?", e->err_cmd, e->err_int, e->err_adma,
++	    e->err_ps, e->err_resp);
++}
++
++/* Controller and card from scratch; the same sequence as the probe that worked on the phone. */
++static int
++ve_bringup(void)
++{
++	static const struct emmc_init_opts opts = { .set_vs = 1, .vs = 0xa9c, .core_swrst = 0, .cdtest = 0 };
++	struct emmc *e = &ve.e;
++	int r;
++
++	emmc_init(e);
++	r = emmc_full_init(e, &opts);
++	if (r) {
++		ve_report_failure("controller/card bring-up");
++		return EIO;
++	}
++	if (ve.pio) {
++		e->use_dma = 0;
++	}
++	return 0;
++}
++
++/* One transfer (count 1..EMMC_MAX_BLOCKS sectors) through the bounce buffer, with recovery. */
++static int
++ve_xfer(uint64_t lba, uint32_t count, bool write)
++{
++	int r = 0;
++
++	for (int attempt = 0; attempt < 3; attempt++) {
++		r = write ? emmc_write(&ve.e, lba, count) : emmc_read(&ve.e, lba, count);
++		if (r == 0) {
++			return 0;
++		}
++		printf("VINCE EMMC: %s of %u sectors at %llu failed (%d, %s, cmd%u int=%x)\n",
++		    write ? "write" : "read", count, (unsigned long long)lba, r,
++		    ve.e.err_what ? ve.e.err_what : "?", ve.e.err_cmd, ve.e.err_int);
++		if (ve_bringup() != 0) {
++			break;
++		}
++	}
++	return EIO;
++}
++
++static int
++ve_write_sectors(uint64_t lba, uint32_t count)
++{
++	if (!ve.writable || !ve.nsect || count == 0 || count > EMMC_MAX_BLOCKS ||
++	    lba < ve.first || lba - ve.first >= ve.nsect || count > ve.nsect - (lba - ve.first) ||
++	    lba + count - 1 > UINT32_MAX || lba < 34 || (ve.gpt_alt && lba + count - 1 >= ve.gpt_alt - 32)) {
++		printf("VINCE EMMC: refusing write of %u sectors at %llu\n", count, (unsigned long long)lba);
++		return EPERM;
++	}
++	return ve_xfer(lba, count, true);
++}
++
++/* ---- GPT ---- */
++
++static uint32_t
++ve_crc32(const uint8_t *p, size_t n)
++{
++	uint32_t c = 0xffffffffu;
++
++	while (n--) {
++		c ^= *p++;
++		for (int k = 0; k < 8; k++) {
++			c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
++		}
++	}
++	return ~c;
++}
++
++static uint8_t ve_hdr[512];
++
++static unsigned
++ve_gpt_name(const uint8_t *ent, char *name)
++{
++	unsigned c;
++
++	for (c = 0; c < 36; c++) {
++		uint16_t ch = (uint16_t)(ent[56 + 2 * c] | ent[57 + 2 * c] << 8);
++
++		if (ch == 0 || ch > 0x7f) {
++			break;
++		}
++		name[c] = (char)ch;
++	}
++	name[c] = 0;
++	return c;
++}
++
++static int
++ve_find_partition(const char *want, bool show_all)
++{
++	const uint8_t *b = ve.e.bounce;
++	uint64_t entry_lba;
++	uint32_t hsize, hcrc, ecrc, nent, esz;
++	int error = ve_xfer(1, 1, false);
++
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("VINCE EMMC: no GPT at LBA 1\n");
++		return ENXIO;
++	}
++	memcpy(&hsize, b + 12, 4);
++	memcpy(&hcrc, b + 16, 4);
++	memcpy(&ve.gpt_alt, b + 32, 8);
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	memcpy(&ecrc, b + 88, 4);
++	if (hsize < 92 || hsize > sizeof(ve_hdr)) {
++		printf("VINCE EMMC: GPT header size %u\n", hsize);
++		return ENXIO;
++	}
++	memcpy(ve_hdr, b, hsize);
++	memset(ve_hdr + 16, 0, 4);
++	bool hdr_ok = ve_crc32(ve_hdr, hsize) == hcrc;
++
++	if (esz != 128 || nent == 0 || nent > VE_GPT_MAX_ENT || nent * esz > EMMC_BOUNCE) {
++		printf("VINCE EMMC: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	error = ve_xfer(entry_lba, (nent * esz + EMMC_BLK - 1) / EMMC_BLK, false);
++	if (error) {
++		return error;
++	}
++	bool ent_ok = ve_crc32(b, (size_t)nent * esz) == ecrc;
++	ve.gpt_ok = hdr_ok && ent_ok;
++	printf("VINCE EMMC: GPT %u entries, header CRC %s, entries CRC %s, backup at LBA %llu\n", nent,
++	    hdr_ok ? "ok" : "BAD", ent_ok ? "ok" : "BAD", (unsigned long long)ve.gpt_alt);
++
++	int found = ENOENT;
++	unsigned used = 0;
++
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *en = b + (size_t)i * esz;
++		char name[37];
++		uint64_t first, last;
++		bool empty = true;
++
++		for (int k = 0; k < 16; k++) {
++			if (en[k]) {
++				empty = false;
++			}
++		}
++		if (empty) {
++			continue;
++		}
++		used++;
++		ve_gpt_name(en, name);
++		memcpy(&first, en + 32, 8);
++		memcpy(&last, en + 40, 8);
++		if (show_all) {
++			printf("  #%u %s: LBA %llu + %llu\n", i + 1, name, (unsigned long long)first,
++			    (unsigned long long)(last - first + 1));
++		}
++		if (found == ENOENT && strcmp(name, want) == 0 && last >= first) {
++			ve.first = first;
++			ve.nsect = last - first + 1;
++			strlcpy(ve.name, name, sizeof(ve.name));
++			found = 0;
++		}
++	}
++	if (found) {
++		printf("VINCE EMMC: no GPT partition named \"%s\" (%u in use)\n", want, used);
++	}
++	return found;
++}
++
++/* What is at the start of the partition (nothing is mounted yet, this is only for the report). */
++static void
++ve_peek(void)
++{
++	const uint8_t *b = ve.e.bounce;
++	const char *what;
++	bool zero = true;
++
++	if (ve_xfer(ve.first, 4, false)) {
++		return;
++	}
++	for (unsigned i = 0; i < 4 * EMMC_BLK; i++) {
++		if (b[i]) {
++			zero = false;
++			break;
++		}
++	}
++	if (b[1024] == 'H' && (b[1025] == '+' || b[1025] == 'X')) {
++		what = b[1025] == '+' ? "HFS+ volume header" : "HFSX volume header";
++	} else if (b[1080] == 0x53 && b[1081] == 0xef) {
++		what = "ext4 superblock (old Android data)";
++	} else if (b[0] == 'N' && b[1] == 'X' && b[2] == 'S' && b[3] == 'B') {
++		what = "APFS container";
++	} else if (zero) {
++		what = "all zeros";
++	} else {
++		what = "unknown";
++	}
++	printf("VINCE EMMC: \"%s\" head: %02x %02x %02x %02x ... @1024: %02x %02x -> %s\n", ve.name, b[0], b[1],
++	    b[2], b[3], b[1024], b[1025], what);
++}
++
++/* ADMA and PIO must return the same data, and a speed figure for the record. */
++static void
++ve_selftest(void)
++{
++	static uint8_t keep[64 * 1024];
++	struct emmc *e = &ve.e;
++	int r1, r2;
++
++	e->use_dma = 1;
++	r1 = emmc_read(e, 0, 128);
++	memcpy(keep, e->bounce, sizeof(keep));
++	e->use_dma = 0;
++	r2 = emmc_read(e, 0, 128);
++	bool same = (r1 == 0 && r2 == 0 && memcmp(keep, e->bounce, sizeof(keep)) == 0);
++
++	e->use_dma = !ve.pio;
++	printf("VINCE EMMC: selftest ADMA vs PIO, 64 KiB at LBA 0: %s (rc %d/%d)\n",
++	    same ? "identical" : "DIFFERENT", r1, r2);
++
++	uint64_t t0 = ve_us(e);
++	int r = 0;
++
++	for (uint32_t i = 0; i < 8 && r == 0; i++) {
++		r = emmc_read(e, ve.first + (uint64_t)i * EMMC_MAX_BLOCKS, EMMC_MAX_BLOCKS);
++	}
++	uint64_t dt = ve_us(e) - t0;
++
++	if (r == 0 && dt != 0) {
++		printf("VINCE EMMC: read 8 MiB in %llu ms (%llu KiB/s)\n", (unsigned long long)(dt / 1000),
++		    (unsigned long long)(8192ull * 1000000ull / dt));
++	} else {
++		printf("VINCE EMMC: speed test failed (rc %d)\n", r);
++	}
++}
++
++/* ---- BSD disk ---- */
++
++static int
++vince_emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!ve.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !ve.writable) ? EROFS : 0;
++}
++
++static int
++vince_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++vince_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * ve.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = ve.nsect * EMMC_BLK;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !ve.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&vince_emmc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = ve.first + pos / EMMC_BLK;
++		uint32_t skip = (uint32_t)(pos % EMMC_BLK);
++		uint32_t want = MIN(count - done, EMMC_BOUNCE - skip);
++		uint32_t sects = (skip + want + EMMC_BLK - 1) / EMMC_BLK;
++		void *bounce = ve.e.bounce;
++
++		if (rd) {
++			error = ve_xfer(lba, sects, false);
++			if (!error) {
++				memcpy(vaddr + done, (const char *)bounce + skip, want);
++			}
++		} else {
++			/* partial sectors at either end: read, merge, write back */
++			if (skip || (want % EMMC_BLK)) {
++				error = ve_xfer(lba, sects, false);
++			}
++			if (!error) {
++				memcpy((char *)bounce + skip, vaddr + done, want);
++				error = ve_write_sectors(lba, sects);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&vince_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++vince_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = ve.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		ve.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = EMMC_BLK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = ve.nsect * EMMC_BLK / ve.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = ve.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;               /* the card's own cache is off (cache_ctrl 0): writes are complete when they return */
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = EMMC_BOUNCE / ve.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = ve.writable ? EMMC_BOUNCE / ve.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++vince_emmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return vince_emmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++vince_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return vince_emmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++vince_emmc_psize(__unused dev_t dev)
++{
++	return ve.ready ? (int)MIN(ve.nsect * EMMC_BLK / ve.secsize, INT_MAX) : -1;
++}
++
++static int
++vince_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(vince_emmc_strategy, NULL, dev, B_READ, minphys, uio, (int)ve.secsize);
++}
++
++static int
++vince_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!ve.writable) {
++		return EROFS;
++	}
++	return physio(vince_emmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)ve.secsize);
++}
++
++static const struct bdevsw vince_emmc_bdevsw = {
++	.d_open     = vince_emmc_open,
++	.d_close    = vince_emmc_close,
++	.d_strategy = vince_emmc_strategy,
++	.d_ioctl    = vince_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = vince_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw vince_emmc_cdevsw = {
++	.d_open       = vince_emmc_open,
++	.d_close      = vince_emmc_close,
++	.d_read       = vince_emmc_read,
++	.d_write      = vince_emmc_write,
++	.d_ioctl      = vince_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++vince_emmc_init(void)
++{
++	char want[64] = "userdata";
++	uint32_t rw = 0, show_all = 0, pio = 0, selftest = 1;
++	int error;
++
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	PE_parse_boot_argn("emmcrw", &rw, sizeof(rw));
++	PE_parse_boot_argn("emmclist", &show_all, sizeof(show_all));
++	PE_parse_boot_argn("emmcpio", &pio, sizeof(pio));
++	PE_parse_boot_argn("emmcselftest", &selftest, sizeof(selftest));
++		ve.pio = (pio == 1);
++
++	printf("VINCE EMMC: start (root partition \"%s\", %s)\n", want, ve.pio ? "PIO" : "ADMA");
++	ve.core = ml_io_map(VE_CORE_PA, VE_MAP_SIZE);
++	ve.gcc = ml_io_map(VE_GCC_PA, VE_MAP_SIZE);
++	if (!ve.core || !ve.gcc) {
++		printf("VINCE EMMC: cannot map registers\n");
++		return ENOMEM;
++	}
++	if (kmem_alloc_contig(kernel_map, &ve.dma, VE_DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("VINCE EMMC: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ve.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	ve.dma_pa = ptoa_64(pn);
++	if (((ve.dma_pa + VE_DMA_SIZE - 1) >> 32) != 0) {
++		/* ADMA2 descriptors with 32-bit addresses */
++		printf("VINCE EMMC: DMA memory at 0x%llx is above 4 GiB\n", (unsigned long long)ve.dma_pa);
++		return ENOMEM;
++	}
++	ve.secsize = DEV_BSIZE;
++	ve.e.ops = &ve_ops;
++	ve.e.priv = (void *)(ve.core + VE_HC_OFF);
++	ve.e.adma = (void *)(ve.dma + VE_DMA_ADMA);
++	ve.e.adma_pa = ve.dma_pa + VE_DMA_ADMA;
++	ve.e.bounce = (uint8_t *)(ve.dma + VE_DMA_BOUNCE);
++	ve.e.bounce_pa = ve.dma_pa + VE_DMA_BOUNCE;
++	printf("VINCE EMMC: DMA at 0x%llx, registers mapped\n", (unsigned long long)ve.dma_pa);
++
++	lck_mtx_lock(&vince_emmc_lock);
++	error = ve_bringup();
++	if (!error) {
++		printf("VINCE EMMC: card up (OCR %x, RCA %u, init %s)\n", ve.e.ocr, ve.e.rca, ve.e.init_log);
++		if (emmc_read_extcsd(&ve.e) == 0) {
++			const uint8_t *x = ve.e.bounce;
++			uint32_t sc;
++
++			memcpy(&sc, x + 212, 4);
++			ve.disk_sects = sc;
++			printf("VINCE EMMC: EXT_CSD rev %u, %u sectors (%u MiB), bus width %u, hs_timing %u\n",
++			    x[192], sc, sc / 2048, x[183], x[185]);
++		}
++		error = ve_find_partition(want, show_all == 1);
++	}
++	if (!error && ve.first + ve.nsect > ve.disk_sects && ve.disk_sects != 0) {
++		printf("VINCE EMMC: partition ends beyond the disk\n");
++		error = ENXIO;
++	}
++	if (!error) {
++		printf("VINCE EMMC: \"%s\": first sector %llu, %llu MiB\n", ve.name, (unsigned long long)ve.first,
++		    (unsigned long long)(ve.nsect * EMMC_BLK >> 20));
++		ve_peek();
++		if (selftest) {
++			ve_selftest();
++		}
++	}
++	lck_mtx_unlock(&vince_emmc_lock);
++	if (error) {
++		return error;
++	}
++
++	ve.bmajor = bdevsw_add(-1, &vince_emmc_bdevsw);
++	if (ve.bmajor < 0) {
++		return ENXIO;
++	}
++	ve.cmajor = cdevsw_add_with_bdev(-1, &vince_emmc_cdevsw, ve.bmajor);
++	if (ve.cmajor < 0) {
++		return ENXIO;
++	}
++	ve.bdev = makedev(ve.bmajor, 0);
++	devfs_make_node(ve.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
++	devfs_make_node(makedev(ve.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
++
++	/* Writes only now, with the partition bounds known, and only with a sound GPT around it. */
++	if (rw != 0) {
++		if (ve.gpt_ok && ve.first >= 34 && ve.gpt_alt > 32 && ve.first + ve.nsect <= ve.gpt_alt - 32) {
++			ve.writable = true;
++		} else {
++			printf("VINCE EMMC: emmcrw=1 ignored: GPT not sound or partition overlaps it\n");
++		}
++	}
++	ve.ready = true;
++	printf("VINCE EMMC: emmcroot0 ready, %s\n", ve.writable ? "READ-WRITE" : "read-only");
++	return 0;
++}
++
++/* Root device for rd=emmcroot0 (IOFindBSDRoot). */
++int
++vince_emmc_rootdev(dev_t *dev)
++{
++	if (!ve.ready) {
++		uint32_t hold = 0;
++		int error = vince_emmc_init();
++
++		/* a failing root mount ends in a panic: leave time to photograph the report */
++		PE_parse_boot_argn("emmchold", &hold, sizeof(hold));
++		if (hold != 0) {
++			printf("VINCE EMMC: holding %u s\n", hold);
++			delay_for_interval(hold * 1000u, NSEC_PER_MSEC);
++		}
++		if (error) {
++			return error;
++		}
++	}
++	*dev = ve.bdev;
++	return 0;
++}
++#endif /* VINCE */
+diff --git a/bsd/dev/vince_emmc_hw.c b/bsd/dev/vince_emmc_hw.c
+new file mode 100644
+index 0000000..de3396e
+--- /dev/null
++++ b/bsd/dev/vince_emmc_hw.c
+@@ -0,0 +1,661 @@
++/*
++ * Polled SDHCI driver for the Redmi 5 Plus eMMC. See emmc.h.
++ *
++ * No libc: no memcpy, no memset (the bare-metal probe links without them).
++ */
++#include "vince_emmc_hw.h"
++
++/* INT_STATUS / INT_ENABLE bits */
++#define INT_CC		(1u << 0)
++#define INT_TC		(1u << 1)
++#define INT_DMA		(1u << 3)
++#define INT_BWR		(1u << 4)
++#define INT_BRR		(1u << 5)
++#define INT_ERR		(1u << 15)
++#define INT_ERRORS	0x07ff8000u	/* error summary + bits 16..26 */
++#define INT_ENABLE_ALL	(INT_CC | INT_TC | INT_DMA | INT_BWR | INT_BRR | 0x07ff0000u)
++
++/* PRESENT_STATE */
++#define PS_CMD_INHIBIT	(1u << 0)
++#define PS_DAT_INHIBIT	(1u << 1)
++#define PS_DAT_ACTIVE	(1u << 2)
++#define PS_DAT0_LEVEL	(1u << 20)
++
++/* TRANSFER_MODE */
++#define TM_DMA		0x01u
++#define TM_BLKCNT	0x02u
++#define TM_AUTOCMD12	0x04u
++#define TM_READ		0x10u
++#define TM_MULTI	0x20u
++
++/* response types for send_cmd() */
++#define R_NONE		0u
++#define R_R1		1u
++#define R_R1B		2u
++#define R_R3		3u	/* 48-bit, no CRC / index check (OCR) */
++#define R_R2		4u	/* 136-bit (CID/CSD) */
++
++#define ERR_TIMEOUT	(-110)
++#define ERR_IO		(-5)
++#define ERR_INVAL	(-22)
++
++#define RD32(e, o)	((e)->ops->rd32((e), (o)))
++#define RD16(e, o)	((e)->ops->rd16((e), (o)))
++#define RD8(e, o)	((e)->ops->rd8((e), (o)))
++#define WR32(e, o, v)	((e)->ops->wr32((e), (o), (v)))
++#define WR16(e, o, v)	((e)->ops->wr16((e), (o), (v)))
++#define WR8(e, o, v)	((e)->ops->wr8((e), (o), (v)))
++
++static void trace_add(struct emmc *e, uint8_t cmd, int res, uint32_t intst, uint32_t resp)
++{
++	/* keep the first failures and the latest events: overwrite the last slot when full */
++	unsigned i = e->ntrace < EMMC_TRACE_N ? e->ntrace++ : EMMC_TRACE_N - 1;
++
++	e->trace[i].cmd = cmd;
++	e->trace[i].result = (int16_t)res;
++	e->trace[i].intst = intst;
++	e->trace[i].resp = resp;
++}
++
++/* Wait until (reg & mask) == (want_set ? mask : 0). */
++static int poll32(struct emmc *e, uint32_t off, uint32_t mask, int want_set, uint64_t timeout_us)
++{
++	uint64_t end = e->ops->us(e) + timeout_us;
++
++	for (;;) {
++		uint32_t v = RD32(e, off);
++
++		if (want_set ? (v & mask) == mask : (v & mask) == 0)
++			return 0;
++		if (e->ops->us(e) > end)
++			return ERR_TIMEOUT;
++	}
++}
++
++static void reset_lines(struct emmc *e, uint8_t bits)
++{
++	uint64_t end = e->ops->us(e) + 100000;
++
++	WR8(e, SD_SW_RESET, bits);
++	while (RD8(e, SD_SW_RESET) & bits) {
++		if (e->ops->us(e) > end)
++			break;
++	}
++}
++
++static void note_error(struct emmc *e, uint8_t cmd, const char *what, uint32_t intst, uint32_t resp)
++{
++	if (e->err_what)
++		return;		/* keep the first one: later ones are usually fallout */
++	e->err_what = what;
++	e->err_cmd = cmd;
++	e->err_int = intst;
++	e->err_adma = RD32(e, SD_ADMA_ERR);
++	e->err_ps = RD32(e, SD_PRESENT);
++	e->err_resp = resp;
++}
++
++/*
++ * Issue one command and wait for the command-complete interrupt. For R1b
++ * without data the busy wait (transfer-complete) is done here too. Data
++ * commands leave transfer-complete to the caller.
++ */
++static int send_cmd(struct emmc *e, uint8_t idx, uint32_t arg, unsigned rtype, uint16_t mode,
++		    int data, uint32_t *resp)
++{
++	uint32_t inh = PS_CMD_INHIBIT | ((data || rtype == R_R1B) ? PS_DAT_INHIBIT : 0);
++	uint16_t flags;
++	uint32_t st = 0;
++	uint64_t end;
++	int r;
++
++	if (poll32(e, SD_PRESENT, inh, 0, 200000)) {
++		note_error(e, idx, "inhibit", 0, 0);
++		trace_add(e, idx, ERR_TIMEOUT, 0, 0);
++		reset_lines(e, 0x06);
++		return ERR_TIMEOUT;
++	}
++	WR32(e, SD_INT_STATUS, 0xffffffffu);
++	WR32(e, SD_ARG, arg);
++	WR16(e, SD_XFER_MODE, mode);
++	switch (rtype) {
++	case R_R1: flags = 0x02 | 0x08 | 0x10; break;	/* 48-bit, CRC, index check */
++	case R_R1B: flags = 0x03 | 0x08 | 0x10; break;	/* 48-bit + busy */
++	case R_R3: flags = 0x02; break;
++	case R_R2: flags = 0x01 | 0x08; break;
++	default: flags = 0; break;
++	}
++	if (data)
++		flags |= 0x20;
++	WR16(e, SD_CMD, (uint16_t)(((uint16_t)idx << 8) | flags));
++
++	end = e->ops->us(e) + 300000;
++	for (;;) {
++		st = RD32(e, SD_INT_STATUS);
++		if (st & INT_ERRORS) {
++			note_error(e, idx, "cmd", st, 0);
++			trace_add(e, idx, ERR_IO, st, 0);
++			reset_lines(e, 0x06);
++			WR32(e, SD_INT_STATUS, 0xffffffffu);
++			return ERR_IO;
++		}
++		if (st & INT_CC)
++			break;
++		if (e->ops->us(e) > end) {
++			note_error(e, idx, "cmd timeout", st, 0);
++			trace_add(e, idx, ERR_TIMEOUT, st, 0);
++			reset_lines(e, 0x06);
++			return ERR_TIMEOUT;
++		}
++	}
++	if (resp)
++		*resp = RD32(e, SD_RESP0);
++	WR32(e, SD_INT_STATUS, INT_CC);
++
++	if (rtype == R_R1B && !data) {
++		end = e->ops->us(e) + 3000000;
++		for (;;) {
++			st = RD32(e, SD_INT_STATUS);
++			if (st & INT_ERRORS) {
++				note_error(e, idx, "busy", st, resp ? *resp : 0);
++				trace_add(e, idx, ERR_IO, st, resp ? *resp : 0);
++				reset_lines(e, 0x06);
++				WR32(e, SD_INT_STATUS, 0xffffffffu);
++				return ERR_IO;
++			}
++			if (st & INT_TC)
++				break;
++			if (e->ops->us(e) > end) {
++				/* no transfer-complete, but the card has released DAT0: busy is over */
++				if (RD32(e, SD_PRESENT) & PS_DAT0_LEVEL)
++					break;
++				note_error(e, idx, "busy timeout", st, resp ? *resp : 0);
++				trace_add(e, idx, ERR_TIMEOUT, st, resp ? *resp : 0);
++				reset_lines(e, 0x06);
++				return ERR_TIMEOUT;
++			}
++		}
++		WR32(e, SD_INT_STATUS, INT_TC);
++	}
++	r = 0;
++	trace_add(e, idx, r, st, resp ? *resp : 0);
++	return r;
++}
++
++void emmc_init(struct emmc *e)
++{
++	e->use_dma = 1;
++	e->rca = 0;
++	e->attach_path = -1;
++	e->err_int = e->err_adma = e->err_ps = e->err_resp = 0;
++	e->err_cmd = 0;
++	e->err_what = 0;
++	e->ntrace = 0;
++
++	WR8(e, SD_TIMEOUT, 0x0e);
++	WR32(e, SD_INT_ENABLE, RD32(e, SD_INT_ENABLE) | INT_ENABLE_ALL);
++	WR32(e, SD_SIG_ENABLE, 0);		/* polled: nothing routed to the interrupt controller */
++	WR32(e, SD_INT_STATUS, 0xffffffffu);
++}
++
++uint32_t emmc_status(struct emmc *e, uint32_t rca)
++{
++	uint32_t resp = 0;
++
++	if (send_cmd(e, 13, rca << 16, R_R1, 0, 0, &resp))
++		return 0xffffffffu;
++	return resp;
++}
++
++static void abort_transfer(struct emmc *e)
++{
++	uint32_t r;
++
++	reset_lines(e, 0x06);
++	/* get the card out of the data state if the host's auto-stop did not */
++	(void)send_cmd(e, 12, 0, R_R1B, 0, 0, &r);
++	reset_lines(e, 0x06);
++	WR32(e, SD_INT_STATUS, 0xffffffffu);
++}
++
++/*
++ * One data transfer of count 512-byte blocks with command idx, to/from the
++ * bounce buffer. idx 8 (SEND_EXT_CSD) is a single-block read with argument 0.
++ */
++static int data_cmd(struct emmc *e, uint8_t idx, uint32_t arg, int write, uint32_t count)
++{
++	uint32_t len = count * EMMC_BLK;
++	uint16_t mode = TM_BLKCNT | (write ? 0 : TM_READ) | (count > 1 ? (TM_MULTI | TM_AUTOCMD12) : 0);
++	uint32_t resp = 0, st = 0;
++	uint64_t end;
++	int r;
++
++	if (count == 0 || count > EMMC_MAX_BLOCKS)
++		return ERR_INVAL;
++
++	if (e->use_dma) {
++		struct { uint16_t attr, len; uint32_t addr; } *d = e->adma;
++		uint32_t nd = (len + EMMC_ADMA_CHUNK - 1) / EMMC_ADMA_CHUNK;
++
++		for (uint32_t i = 0; i < nd; i++) {
++			uint32_t off = i * EMMC_ADMA_CHUNK;
++			uint32_t n = len - off < EMMC_ADMA_CHUNK ? len - off : EMMC_ADMA_CHUNK;
++
++			d[i].attr = (uint16_t)(0x21 | (i == nd - 1 ? 0x02 : 0));	/* valid, tran, end */
++			d[i].len = (uint16_t)n;
++			d[i].addr = (uint32_t)(e->bounce_pa + off);
++		}
++		e->ops->clean(e, e->adma, nd * 8);
++		if (write) {
++			e->ops->clean(e, e->bounce, len);
++		} else {
++			e->ops->clean(e, e->bounce, len);
++			e->ops->inval(e, e->bounce, len);
++		}
++		WR32(e, SD_ADMA_ADDR, (uint32_t)e->adma_pa);
++		WR32(e, SD_ADMA_ADDR + 4, (uint32_t)(e->adma_pa >> 32));
++		mode |= TM_DMA;
++	}
++	WR8(e, SD_HOST_CTL, (uint8_t)((RD8(e, SD_HOST_CTL) & ~0x18) | (e->use_dma ? 0x10 : 0x00)));
++	WR8(e, SD_TIMEOUT, 0x0e);
++	WR16(e, SD_BLKSIZE, 0x7000 | EMMC_BLK);
++	WR16(e, SD_BLKCOUNT, (uint16_t)count);
++
++	r = send_cmd(e, idx, arg, R_R1, mode, 1, &resp);
++	if (r) {
++		abort_transfer(e);
++		return r;
++	}
++
++	end = e->ops->us(e) + 5000000 + (uint64_t)count * 20000;
++	if (e->use_dma) {
++		for (;;) {
++			st = RD32(e, SD_INT_STATUS);
++			if (st & INT_ERRORS) {
++				note_error(e, idx, "adma data", st, resp);
++				trace_add(e, idx, ERR_IO, st, resp);
++				abort_transfer(e);
++				return ERR_IO;
++			}
++			if (st & INT_TC)
++				break;
++			if (e->ops->us(e) > end) {
++				note_error(e, idx, "adma timeout", st, resp);
++				trace_add(e, idx, ERR_TIMEOUT, st, resp);
++				abort_transfer(e);
++				return ERR_TIMEOUT;
++			}
++		}
++	} else {
++		uint32_t *buf = (uint32_t *)(void *)e->bounce;
++
++		for (uint32_t b = 0; b < count; b++) {
++			uint32_t want = write ? INT_BWR : INT_BRR;
++
++			for (;;) {
++				st = RD32(e, SD_INT_STATUS);
++				if (st & INT_ERRORS) {
++					note_error(e, idx, "pio data", st, resp);
++					trace_add(e, idx, ERR_IO, st, resp);
++					abort_transfer(e);
++					return ERR_IO;
++				}
++				if (st & want)
++					break;
++				if (e->ops->us(e) > end) {
++					note_error(e, idx, "pio timeout", st, resp);
++					trace_add(e, idx, ERR_TIMEOUT, st, resp);
++					abort_transfer(e);
++					return ERR_TIMEOUT;
++				}
++			}
++			WR32(e, SD_INT_STATUS, want);
++			for (uint32_t w = 0; w < EMMC_BLK / 4; w++) {
++				if (write)
++					WR32(e, SD_BUF, buf[b * (EMMC_BLK / 4) + w]);
++				else
++					buf[b * (EMMC_BLK / 4) + w] = RD32(e, SD_BUF);
++			}
++		}
++		for (;;) {
++			st = RD32(e, SD_INT_STATUS);
++			if (st & INT_ERRORS) {
++				note_error(e, idx, "pio end", st, resp);
++				trace_add(e, idx, ERR_IO, st, resp);
++				abort_transfer(e);
++				return ERR_IO;
++			}
++			if (st & INT_TC)
++				break;
++			if (e->ops->us(e) > end) {
++				note_error(e, idx, "pio end timeout", st, resp);
++				trace_add(e, idx, ERR_TIMEOUT, st, resp);
++				abort_transfer(e);
++				return ERR_TIMEOUT;
++			}
++		}
++	}
++	WR32(e, SD_INT_STATUS, INT_TC | INT_DMA | INT_BRR | INT_BWR);
++	if (e->use_dma && !write)
++		e->ops->inval(e, e->bounce, len);
++	/* the card may still be programming after the last block of a write */
++	if (poll32(e, SD_PRESENT, PS_DAT_INHIBIT | PS_DAT_ACTIVE, 0, 3000000)) {
++		note_error(e, idx, "dat busy", st, resp);
++		trace_add(e, idx, ERR_TIMEOUT, st, resp);
++		abort_transfer(e);
++		return ERR_TIMEOUT;
++	}
++	trace_add(e, idx, 0, st, resp);
++	return 0;
++}
++
++int emmc_read(struct emmc *e, uint64_t lba, uint32_t count)
++{
++	if (lba > 0xffffffffull)
++		return ERR_INVAL;
++	return data_cmd(e, count > 1 ? 18 : 17, (uint32_t)lba, 0, count);
++}
++
++int emmc_write(struct emmc *e, uint64_t lba, uint32_t count)
++{
++	if (lba > 0xffffffffull)
++		return ERR_INVAL;
++	return data_cmd(e, count > 1 ? 25 : 24, (uint32_t)lba, 1, count);
++}
++
++int emmc_read_extcsd(struct emmc *e)
++{
++	return data_cmd(e, 8, 0, 0, 1);
++}
++
++int emmc_switch(struct emmc *e, uint8_t ext_index, uint8_t value)
++{
++	uint32_t resp = 0;
++
++	return send_cmd(e, 6, (3u << 24) | ((uint32_t)ext_index << 16) | ((uint32_t)value << 8) | 1u,
++			R_R1B, 0, 0, &resp);
++}
++
++static int select_card(struct emmc *e, uint32_t rca)
++{
++	uint32_t resp = 0;
++
++	return send_cmd(e, 7, rca << 16, R_R1B, 0, 0, &resp);
++}
++
++int emmc_attach(struct emmc *e)
++{
++	uint32_t st = 0xffffffffu;
++	uint32_t rca;
++	int r;
++
++	e->attach_path = 0;
++	r = emmc_read(e, 1, 1);
++	if (r == 0)
++		return 0;
++
++	/* an awake card that answers CMD13 under some RCA, but is deselected or otherwise not ready */
++	for (rca = 1; rca <= 4; rca++) {
++		st = emmc_status(e, rca);
++		if (st != 0xffffffffu)
++			break;
++	}
++	if (rca <= 4) {
++		e->rca = rca;
++		if (((st >> 9) & 0xf) != 4) {		/* not in the transfer state */
++			e->attach_path = 1;
++			(void)select_card(e, rca);
++		}
++		r = emmc_read(e, 1, 1);
++		if (r == 0)
++			return 0;
++	}
++
++	/* a sleeping card answers nothing but CMD5 (awake) */
++	for (rca = 1; rca <= 4; rca++) {
++		uint32_t resp = 0;
++
++		if (send_cmd(e, 5, rca << 16, R_R1B, 0, 0, &resp) == 0) {
++			e->rca = rca;
++			e->attach_path = 2;
++			(void)select_card(e, rca);
++			r = emmc_read(e, 1, 1);
++			if (r == 0)
++				return 0;
++			break;
++		}
++	}
++	e->attach_path = -1;
++	return r ? r : ERR_IO;
++}
++
++/* ---- full initialisation ---- */
++
++#define CORE_POWER		0x00
++#define CORE_SW_RST		(1u << 7)
++#define CORE_HC_MODE		0x78
++#define CORE_PWRCTL_STATUS	0xdc
++#define CORE_PWRCTL_MASK	0xe0
++#define CORE_PWRCTL_CLEAR	0xe4
++#define CORE_PWRCTL_CTL		0xe8
++
++static void udelay(struct emmc *e, uint32_t n)
++{
++	if (e->ops->delay_us) {
++		e->ops->delay_us(e, n);
++	} else {
++		uint64_t end = e->ops->us(e) + n;
++
++		while (e->ops->us(e) < end)
++			;
++	}
++}
++
++static void step(struct emmc *e, char ch)
++{
++	if (e->init_n < sizeof(e->init_log) - 1) {
++		e->init_log[e->init_n++] = ch;
++		e->init_log[e->init_n] = 0;
++	}
++}
++
++/*
++ * Qualcomm power handshake: after a change of bus power or IO voltage the core latches a status bit
++ * and keeps the command engine stopped until it is cleared and acknowledged (Linux does this in its
++ * power-IRQ handler). Handle every event that shows up in the window; a quiet gap of 3 ms after the
++ * last one ends it.
++ */
++static void pwr_handshake(struct emmc *e, uint64_t window_us)
++{
++	uint64_t end, now;
++
++	if (!e->ops->crd)
++		return;
++	end = e->ops->us(e) + window_us;
++	for (;;) {
++		uint32_t st = e->ops->crd(e, CORE_PWRCTL_STATUS) & 0xf;
++
++		now = e->ops->us(e);
++		if (st) {
++			uint32_t ack = ((st & 3) ? 1u : 0u) | ((st & 0xc) ? 4u : 0u);
++
++			e->ops->cwr(e, CORE_PWRCTL_CLEAR, st);
++			e->ops->cwr(e, CORE_PWRCTL_CTL, ack);
++			e->pwr_acks++;
++			end = now + 3000;	/* more events may follow */
++		}
++		if (now > end)
++			break;
++		udelay(e, 100);
++	}
++}
++
++/*
++ * SD clock: Qualcomm has no usable SDHCI divider, the rate comes from the clock controller. Without
++ * a set_hz hook (PC test) the SDHCI divider of a 200 MHz base clock is used instead.
++ */
++static int bus_clock(struct emmc *e, uint32_t hz)
++{
++	uint16_t v = 0;
++	uint64_t end;
++
++	WR16(e, SD_CLK_CTL, 0);
++	if (e->ops->set_hz) {
++		int r = e->ops->set_hz(e, hz);
++
++		if (r)
++			return r;
++	} else {
++		unsigned n = (unsigned)(200000000u / (2 * hz));
++
++		v = (uint16_t)(((n & 0xff) << 8) | (((n >> 8) & 3) << 6));
++	}
++	WR16(e, SD_CLK_CTL, (uint16_t)(v | 1));		/* internal clock on */
++	end = e->ops->us(e) + 50000;
++	while (!(RD16(e, SD_CLK_CTL) & 2)) {		/* ... and stable */
++		if (e->ops->us(e) > end)
++			return ERR_TIMEOUT;
++	}
++	WR16(e, SD_CLK_CTL, (uint16_t)(v | 1 | 4));	/* SD clock on */
++	return 0;
++}
++
++#define FAIL(e, r)	do { step((e), '!'); return (r); } while (0)
++
++int emmc_full_init(struct emmc *e, const struct emmc_init_opts *o)
++{
++	uint32_t resp = 0;
++	uint64_t end;
++	int r;
++
++	e->init_n = 0;
++	e->init_log[0] = 0;
++	e->err_what = 0;
++	e->err_cmd = 0;
++	e->err_int = e->err_adma = e->err_ps = e->err_resp = 0;
++	e->ntrace = 0;
++	e->rca = 0;
++	e->attach_path = -1;
++	e->use_dma = 1;
++	e->ocr = 0;
++
++	/* optional: reset the whole SDCC core (older Qualcomm drivers did this) */
++	if (o->core_swrst && e->ops->crd) {
++		e->ops->cwr(e, CORE_POWER, e->ops->crd(e, CORE_POWER) | CORE_SW_RST);
++		end = e->ops->us(e) + 10000;
++		while (e->ops->crd(e, CORE_POWER) & CORE_SW_RST) {
++			if (e->ops->us(e) > end) {
++				step(e, 'z');
++				break;
++			}
++		}
++		if (!(e->ops->crd(e, CORE_POWER) & CORE_SW_RST))
++			step(e, 'Z');
++	}
++
++	/* Linux order: vendor-spec back to its power-on value, then SDHCI mode on, then FF clock reset off */
++	if (o->set_vs)
++		WR32(e, SD_VENDOR_SPEC, o->vs);
++	if (e->ops->crd) {
++		e->ops->cwr(e, CORE_HC_MODE, 1);
++		e->ops->cwr(e, CORE_HC_MODE, e->ops->crd(e, CORE_HC_MODE) | (1u << 13));
++		e->ops->cwr(e, CORE_PWRCTL_MASK, 0xf);
++	}
++	step(e, 'H');
++	pwr_handshake(e, 2000);		/* clear anything the bootloader left latched */
++
++	/* reset the whole SDHCI block */
++	WR8(e, SD_SW_RESET, 0x01);
++	end = e->ops->us(e) + 100000;
++	while (RD8(e, SD_SW_RESET) & 1) {
++		if (e->ops->us(e) > end) {
++			note_error(e, 0, "reset all", 0, 0);
++			FAIL(e, ERR_TIMEOUT);
++		}
++	}
++	step(e, 'R');
++
++	if (o->set_vs)
++		WR32(e, SD_VENDOR_SPEC, o->vs);	/* the reset may have changed it */
++	WR8(e, SD_TIMEOUT, 0x0e);
++	WR32(e, SD_INT_ENABLE, INT_ENABLE_ALL);
++	WR32(e, SD_SIG_ENABLE, 0);
++	WR32(e, SD_INT_STATUS, 0xffffffffu);
++	WR8(e, SD_HOST_CTL, o->cdtest ? 0xc0 : 0);	/* 1-bit, PIO, normal speed (+ fake card-detect) */
++	WR16(e, SD_HOST_CTL2, 0);
++
++	/* bus power on at 1.8 V (the eMMC supplies stay as the bootloader left them), then acknowledge */
++	WR8(e, SD_POWER, 0x0b);
++	pwr_handshake(e, 30000);
++	step(e, 'P');
++
++	/* identification clock 400 kHz */
++	r = bus_clock(e, 400000);
++	if (r) {
++		note_error(e, 0, "clock", 0, 0);
++		FAIL(e, r);
++	}
++	udelay(e, 3000);
++	step(e, 'C');
++
++	/* CMD0: go idle. Needs no card, so it only proves that the command engine runs. */
++	r = send_cmd(e, 0, 0, R_NONE, 0, 0, 0);
++	if (r)
++		FAIL(e, r);
++	step(e, '0');
++	udelay(e, 5000);
++
++	end = e->ops->us(e) + 1500000;
++	for (;;) {					/* CMD1: wait until the card is ready */
++		r = send_cmd(e, 1, 0x40ff8080u, R_R3, 0, 0, &resp);
++		if (r)
++			FAIL(e, r);
++		if (resp & 0x80000000u)
++			break;
++		if (e->ops->us(e) > end) {
++			note_error(e, 1, "card busy", 0, resp);
++			FAIL(e, ERR_TIMEOUT);
++		}
++		udelay(e, 2000);
++	}
++	e->ocr = resp;
++	step(e, '1');
++
++	r = send_cmd(e, 2, 0, R_R2, 0, 0, &resp);	/* CMD2: CID */
++	if (r)
++		FAIL(e, r);
++	step(e, '2');
++
++	r = send_cmd(e, 3, 2u << 16, R_R1, 0, 0, &resp);	/* CMD3: we choose RCA 2 */
++	if (r)
++		FAIL(e, r);
++	e->rca = 2;
++	step(e, '3');
++
++	r = bus_clock(e, 19200000);			/* transfer clock: XO, no PLL needed */
++	if (r) {
++		note_error(e, 0, "clock 19.2M", 0, 0);
++		FAIL(e, r);
++	}
++	udelay(e, 1000);
++
++	r = send_cmd(e, 7, 2u << 16, R_R1B, 0, 0, &resp);	/* CMD7: select */
++	if (r)
++		FAIL(e, r);
++	step(e, '7');
++
++	r = emmc_switch(e, 183, 2);			/* BUS_WIDTH = 8-bit SDR */
++	if (r)
++		FAIL(e, r);
++	WR8(e, SD_HOST_CTL, (uint8_t)(RD8(e, SD_HOST_CTL) | 0x20));
++	step(e, 'W');
++
++	resp = emmc_status(e, 2);
++	if (resp == 0xffffffffu || ((resp >> 9) & 0xf) != 4) {
++		note_error(e, 13, "not in tran state", 0, resp);
++		FAIL(e, ERR_IO);
++	}
++	step(e, 'S');
++	e->attach_path = 3;
++	return 0;
++}
+diff --git a/bsd/dev/vince_emmc_hw.h b/bsd/dev/vince_emmc_hw.h
+new file mode 100644
+index 0000000..94521be
+--- /dev/null
++++ b/bsd/dev/vince_emmc_hw.h
+@@ -0,0 +1,141 @@
++/*
++ * Polled SDHCI driver for the eMMC of the Redmi 5 Plus (Qualcomm sdhci-msm host in SDHCI mode).
++ *
++ * Two ways to get a working card: emmc_attach() reuses what the Xiaomi bootloader (LK) left behind
++ * (it did not work on the phone: the command engine never ran), emmc_full_init() brings controller
++ * and card up from scratch in the order the Linux driver uses (vendor-spec reset, HC mode, power
++ * handshake, clock from the clock controller, CMD0/1/2/3/7).
++ *
++ * Environment-independent: all hardware access goes through struct emmc_ops, so the same file runs
++ * in the bare-metal M3a probe, in the XNU kernel and in a PC test against a simulated controller.
++ *
++ * One request at a time. Data moves through a single DMA-able bounce buffer (EMMC_BOUNCE bytes, below
++ * 4 GiB, physically contiguous) with ADMA2 (32-bit) or, as a fallback, by PIO through the buffer data
++ * port.
++ */
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++
++#define EMMC_BLK		512u
++#define EMMC_BOUNCE		(1u << 20)
++#define EMMC_MAX_BLOCKS		(EMMC_BOUNCE / EMMC_BLK)
++#define EMMC_ADMA_CHUNK		32768u
++#define EMMC_ADMA_NDESC		(EMMC_BOUNCE / EMMC_ADMA_CHUNK)
++
++struct emmc;
++
++struct emmc_ops {
++	uint32_t (*rd32)(struct emmc *e, uint32_t off);
++	uint16_t (*rd16)(struct emmc *e, uint32_t off);
++	uint8_t  (*rd8)(struct emmc *e, uint32_t off);
++	void (*wr32)(struct emmc *e, uint32_t off, uint32_t v);
++	void (*wr16)(struct emmc *e, uint32_t off, uint16_t v);
++	void (*wr8)(struct emmc *e, uint32_t off, uint8_t v);
++	uint64_t (*us)(struct emmc *e);			/* free-running microseconds */
++	void (*clean)(struct emmc *e, void *va, uint64_t len);	/* write back (to the device) */
++	void (*inval)(struct emmc *e, void *va, uint64_t len);	/* drop (before reading device data) */
++	/* Qualcomm SDCC core registers (core base = SDHCI base - 0x900); may be NULL where unused */
++	uint32_t (*crd)(struct emmc *e, uint32_t off);
++	void (*cwr)(struct emmc *e, uint32_t off, uint32_t v);
++	void (*delay_us)(struct emmc *e, uint32_t us);
++	/*
++	 * Set the rate of the SD clock source (Qualcomm: the controller has no usable divider, the clock
++	 * controller sets the rate). NULL = use the SDHCI divider (PC test). 0 = ok.
++	 */
++	int (*set_hz)(struct emmc *e, uint32_t hz);
++};
++
++#define EMMC_TRACE_N 24
++
++struct emmc_trace {
++	uint8_t cmd;
++	int16_t result;		/* 0 = ok, negative = failure */
++	uint32_t intst;		/* INT_STATUS seen at the end */
++	uint32_t resp;		/* response word 0 */
++};
++
++struct emmc {
++	const struct emmc_ops *ops;
++	void *priv;		/* environment pointer (register base etc.) */
++
++	uint8_t *bounce;	/* EMMC_BOUNCE bytes */
++	uint64_t bounce_pa;
++	void *adma;		/* EMMC_ADMA_NDESC * 8 bytes, 8-byte aligned */
++	uint64_t adma_pa;
++
++	int use_dma;		/* 1 = ADMA2, 0 = PIO */
++	uint32_t rca;		/* relative card address once found, else 0 */
++	int attach_path;	/* 0 = card was ready, 1 = selected it, 2 = woke it from sleep, -1 = failed */
++
++	/* last failure, for the screen / log */
++	uint32_t err_int, err_adma, err_ps, err_resp;
++	uint8_t err_cmd;
++	const char *err_what;
++
++	struct emmc_trace trace[EMMC_TRACE_N];
++	unsigned ntrace;
++
++	/* full initialisation (emmc_full_init) */
++	char init_log[24];	/* one letter per completed step, '!' where it stopped */
++	unsigned init_n;
++	uint32_t ocr;
++	uint32_t pwr_acks;	/* Qualcomm power-control events acknowledged */
++};
++
++/* Standard SDHCI register offsets (SD Host Controller Simplified Spec 3.0). */
++#define SD_DMA_ADDR	0x00
++#define SD_BLKSIZE	0x04
++#define SD_BLKCOUNT	0x06
++#define SD_ARG		0x08
++#define SD_XFER_MODE	0x0c
++#define SD_CMD		0x0e
++#define SD_RESP0	0x10
++#define SD_BUF		0x20
++#define SD_PRESENT	0x24
++#define SD_HOST_CTL	0x28
++#define SD_POWER	0x29
++#define SD_CLK_CTL	0x2c
++#define SD_TIMEOUT	0x2e
++#define SD_SW_RESET	0x2f
++#define SD_INT_STATUS	0x30
++#define SD_INT_ENABLE	0x34
++#define SD_SIG_ENABLE	0x38
++#define SD_AUTOCMD_ERR	0x3c
++#define SD_HOST_CTL2	0x3e
++#define SD_CAPS		0x40
++#define SD_CAPS1	0x44
++#define SD_ADMA_ERR	0x54
++#define SD_ADMA_ADDR	0x58
++#define SD_VENDOR_SPEC	0x10c	/* Qualcomm (relative to the SDHCI block, not to the core block) */
++#define SD_VERSION	0xfe
++
++/* The caller fills ops, priv, bounce, bounce_pa, adma, adma_pa. */
++void emmc_init(struct emmc *e);
++/* Make the card readable (it may have been put to sleep or deselected by LK). 0 = ok. */
++int emmc_attach(struct emmc *e);
++/* Read count (1..EMMC_MAX_BLOCKS) 512-byte sectors at lba into e->bounce. 0 = ok, negative = error. */
++int emmc_read(struct emmc *e, uint64_t lba, uint32_t count);
++/* Write count sectors from e->bounce. Same limits. */
++int emmc_write(struct emmc *e, uint64_t lba, uint32_t count);
++/* Variations of the controller bring-up, for the experiments on the phone. */
++struct emmc_init_opts {
++	uint8_t set_vs;		/* write VENDOR_SPEC (hc+0x10c) with vs before and after the controller reset */
++	uint32_t vs;
++	uint8_t core_swrst;	/* reset the SDCC core through CORE_POWER bit 7 first */
++	uint8_t cdtest;		/* force "card inserted" in HOST_CTL */
++};
++/*
++ * Bring the controller and the card up from scratch, the way an OS driver does, without relying on
++ * what the bootloader left: vendor-spec reset, Qualcomm HC mode on, controller reset, power-control
++ * handshake, 400 kHz identification clock, CMD0/1/2/3/7, transfer clock, 8-bit bus. 0 = ok.
++ * e->init_log shows how far it got: H=hc mode, R=reset, P=power, C=clock, 0..7=commands, W=8-bit,
++ * S=tran state, '!' = stopped here.
++ */
++int emmc_full_init(struct emmc *e, const struct emmc_init_opts *o);
++/* CMD8: read EXT_CSD (512 bytes) into e->bounce. */
++int emmc_read_extcsd(struct emmc *e);
++/* CMD6 SWITCH, write-byte mode: EXT_CSD[index] = value. */
++int emmc_switch(struct emmc *e, uint8_t ext_index, uint8_t value);
++/* CMD13: returns the 32-bit card status, or 0xffffffff when the card does not answer. */
++uint32_t emmc_status(struct emmc *e, uint32_t rca);
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..5467517 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,6 +784,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ #endif
+ 
++#if defined(VINCE)
++//
++//	VINCE: root on a GPT partition of the internal eMMC (bsd/dev/vince_emmc.c)
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int vince_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = vince_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: VINCE eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
