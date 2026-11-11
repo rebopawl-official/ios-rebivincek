@@ -1,0 +1,134 @@
+From a34c3229c02443fba11a85a0d0c6747e22a1ffe9 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 11 Nov 2026 21:40:54 +0000
+Subject: [PATCH] 1012 vince: vincevigtest shows eight bands in three phases to
+ tell the VIG0 fetch from its scaler
+
+The first test showed red and green about a tenth of the screen each instead of a quarter and
+no blue bar, so the vertical mapping is wrong somewhere. Phase 1 shows a 1080x2160 window
+unscaled (the fetch alone), phase 2 the whole picture with the nearest filter, phase 3 with the
+downscale filter, all as eight equal bands.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 78 ++++++++++++++-------------
+ 1 file changed, 42 insertions(+), 36 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f6e4ac9..07debbe 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -656,11 +656,13 @@ AppleCLCD::blitVince(void)
+ }
+ 
+ /*
+- * vincevigtest=1: show a 1125x2436 test picture (four colour bars, red, green, blue, white, a black frame, black lines every
+- * 125 pixels in the white bar) through the MDP's VIG0 pipe, which scales it to the panel's 1080x2160, for 6 seconds, then
+- * give the screen back to RGB0. The sizes and the scaler's numbers are the Linux driver's (mdp5_plane.c). The MDP of this
+- * chip (v1.16) has no shared memory pool in use (the SMP registers read zero while RGB0 scans out), so nothing is allocated.
+- * What to look at: are the colours right (red on top), is the whole picture there, with the frame, and is it smooth.
++ * vincevigtest=1: show a 1125x2436 test picture through the MDP's VIG0 pipe, which has the scaler, then give the screen back
++ * to RGB0. The picture is eight horizontal bands of equal height (red, green, blue, white, yellow, cyan, magenta, grey) with a
++ * black frame of 8 pixels. Three phases of 4 s each, to tell the fetch from the scaler: 1) the top-left 1080x2160 window, no
++ * scaling (what the pipe fetches); 2) the whole picture scaled with the nearest filter; 3) the whole picture scaled with the
++ * Linux driver's downscale filter. Each should show the eight bands, 1/8 of the screen high; phase 1 only the first
++ * 1080x2160 of the picture, i.e. the sixth band cut. The numbers are from mdp5_plane.c. The MDP of this chip (v1.16) has no SMP use
++ * (its registers read zero while RGB0 scans out), so nothing is allocated.
+  */
+ void
+ AppleCLCD::vinceVigTest(void)
+@@ -672,8 +674,9 @@ AppleCLCD::vinceVigTest(void)
+ 	volatile uint32_t *ctl = (volatile uint32_t *)ml_io_map(0x01a02000, 0x1000);      /* CTL0 */
+ 	SweetSurface *surf = pa != 0 ? sweet_surface_create_physical(pa, W, H, ROW, SWEET_FB_FORMAT_BGRA) : NULL;
+ 	uintptr_t va = surf != NULL ? surf->kernelAddress() : 0;
+-	uint32_t i, t, y, x;
+-	const uint32_t bars[4] = { 0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu };      /* B in the low byte */
++	uint32_t i, t, y, x, ph;
++	const uint32_t bars[8] = { 0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu, 0xffffff00u, 0xff00ffffu, 0xffff00ffu,
++		0xff808080u };      /* B in the low byte */
+ 
+ 	if (va == 0 || vig == NULL || ctl == NULL || ctl[0] != 0x200) {
+ 		IOLog("VINCE VIG TEST: not started (pool %#llx map %#lx ctl0 layer %#x)\n", (unsigned long long)pa, (unsigned long)va,
+@@ -684,18 +687,10 @@ AppleCLCD::vinceVigTest(void)
+ 		uint32_t *row = (uint32_t *)(va + (uint64_t)y * ROW);
+ 
+ 		for (x = 0; x < W; x++) {
+-			uint32_t c = bars[y * 4 / H];
+-
+-			if (x < 8 || x >= W - 8 || y < 8 || y >= H - 8) {
+-				c = 0xff000000u;
+-			} else if (y * 4 / H == 3 && (x % 125) < 3) {
+-				c = 0xff000000u;
+-			}
+-			row[x] = c;
++			row[x] = (x < 8 || x >= W - 8 || y < 8 || y >= H - 8) ? 0xff000000u : bars[y * 8 / H];
+ 		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	vig[0x00 / 4] = (H << 16) | W;                    /* SRC_SIZE */
+ 	vig[0x04 / 4] = (H << 16) | W;                    /* SRC_IMG_SIZE */
+ 	vig[0x08 / 4] = 0;                                /* SRC_XY */
+ 	vig[0x0c / 4] = (2160u << 16) | 1080u;            /* OUT_SIZE */
+@@ -705,27 +700,38 @@ AppleCLCD::vinceVigTest(void)
+ 	vig[0x30 / 4] = 0x36ff;                           /* FORMAT: 4 x 8 bits, 4 bytes, 4 elements, no alpha blend */
+ 	vig[0x34 / 4] = 0x03020001;                       /* UNPACK: B, G, R, A */
+ 	vig[0x38 / 4] = 0x80000000;                       /* OP_MODE: software pixel extension */
+-	for (i = 0; i < 4; i++) {
+-		vig[(0x100 + 0x10 * i) / 4] = 0x1;                          /* SW_PIX_EXT_LR: one pixel to the right */
+-		vig[(0x104 + 0x10 * i) / 4] = 0x1;                          /* SW_PIX_EXT_TB: one below */
+-		vig[(0x108 + 0x10 * i) / 4] = ((W + 1) << 16) | (H + 1);    /* REQ_PIXELS */
+-	}
+-	vig[0x210 / 4] = (uint32_t)(((uint64_t)1 << 21) * W / 1080);      /* SCALE_PHASE_STEP_X */
+-	vig[0x214 / 4] = (uint32_t)(((uint64_t)1 << 21) * H / 2160);      /* SCALE_PHASE_STEP_Y */
+-	vig[0x218 / 4] = vig[0x210 / 4];
+-	vig[0x21c / 4] = vig[0x214 / 4];
+-	vig[0x204 / 4] = 0x3 | (2u << 8) | (2u << 12) | (2u << 16) | (2u << 20);   /* SCALE_CONFIG: both ways on, filter 2 (downscale) */
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	IOLog("VINCE VIG TEST: VIG0 src %#x size %#x out %#x format %#x step x %#x y %#x config %#x\n", vig[0x14 / 4], vig[0],
+-	    vig[0x0c / 4], vig[0x30 / 4], vig[0x210 / 4], vig[0x214 / 4], vig[0x204 / 4]);
+-	ctl[0] = 0x1;                                     /* LAYER: VIG0 in place of RGB0 at the base stage */
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	ctl[0x18 / 4] = 0x20000 | (1u << 0) | (1u << 3) | (1u << 6);   /* CTL, VIG0, RGB0, LM0 */
+-	for (t = 0; t < 200 && (ctl[0x18 / 4] & 0x49) != 0; t++) {
+-		IODelay(200);
++	for (ph = 0; ph < 3; ph++) {
++		uint32_t sw = ph == 0 ? 1080 : W, sh = ph == 0 ? 2160 : H;
++
++		vig[0x00 / 4] = (sh << 16) | sw;              /* SRC_SIZE */
++		for (i = 0; i < 4; i++) {
++			vig[(0x100 + 0x10 * i) / 4] = ph == 0 ? 0 : 0x1;                       /* SW_PIX_EXT_LR */
++			vig[(0x104 + 0x10 * i) / 4] = ph == 0 ? 0 : 0x1;                       /* SW_PIX_EXT_TB */
++			vig[(0x108 + 0x10 * i) / 4] = ph == 0 ? ((sw << 16) | sh) : (((sw + 1) << 16) | (sh + 1));   /* REQ_PIXELS */
++		}
++		vig[0x210 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << 21) * W / 1080);   /* SCALE_PHASE_STEP_X */
++		vig[0x214 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << 21) * H / 2160);   /* SCALE_PHASE_STEP_Y */
++		vig[0x218 / 4] = vig[0x210 / 4];
++		vig[0x21c / 4] = vig[0x214 / 4];
++		if (ph == 0) {
++			vig[0x204 / 4] = 0;                       /* SCALE_CONFIG: off */
++		} else {
++			uint32_t f = ph == 1 ? 0 : 2;             /* nearest, then the downscale filter */
++
++			vig[0x204 / 4] = 0x3 | (f << 8) | (f << 12) | (f << 16) | (f << 20);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IOLog("VINCE VIG TEST: phase %u: src %#x size %#x out %#x format %#x step x %#x y %#x config %#x\n", ph + 1,
++		    vig[0x14 / 4], vig[0], vig[0x0c / 4], vig[0x30 / 4], vig[0x210 / 4], vig[0x214 / 4], vig[0x204 / 4]);
++		ctl[0] = 0x1;                                 /* LAYER: VIG0 in place of RGB0 at the base stage */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ctl[0x18 / 4] = 0x20000 | (1u << 0) | (1u << 3) | (1u << 6);   /* CTL, VIG0, RGB0, LM0 */
++		for (t = 0; t < 200 && (ctl[0x18 / 4] & 0x41) != 0; t++) {
++			IODelay(200);
++		}
++		IOLog("VINCE VIG TEST: phase %u shown, flush read back %#x after %u us, layer %#x\n", ph + 1, ctl[0x18 / 4], t * 200, ctl[0]);
++		IOSleep(4000);
+ 	}
+-	IOLog("VINCE VIG TEST: switched, flush read back %#x after %u us, layer %#x\n", ctl[0x18 / 4], t * 200, ctl[0]);
+-	IOSleep(6000);
+ 	ctl[0] = 0x200;                                   /* RGB0 again */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	ctl[0x18 / 4] = 0x20000 | (1u << 0) | (1u << 3) | (1u << 6);
+-- 
+2.43.0
+
