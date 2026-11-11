@@ -1,0 +1,40 @@
+From 62cf8afb474b746aab77f9bdfe2fadb335d0d1e2 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 11 Nov 2026 19:30:21 +0000
+Subject: [PATCH] 1010 vince: vincemdpdump reads the real CTL blocks, the SMP
+ and the VIG0 scaler registers
+
+Read-only. CTL0-2 are at +0x1000/+0x1200/+0x1400, not +0x600. The SMP window shows which
+memory blocks the loader gave RGB0 (VIG0 needs its own to scan out), and VIG0's pixel
+extension and scale registers show what the scaler starts with.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ bsd/dev/vince_adreno.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
+index caf3786..44e124b 100644
+--- a/bsd/dev/vince_adreno.c
++++ b/bsd/dev/vince_adreno.c
+@@ -1058,9 +1058,14 @@ vince_mdp_dump(void)
+ {
+ 	static const struct { const char *name; uint32_t off; uint32_t len; } win[] = {
+ 		{ "HW", 0x000, 0x20 }, { "INTF_SEL", 0x100, 0x10 },
+-		{ "CTL0", 0x600, 0x40 }, { "CTL1", 0x700, 0x40 }, { "CTL2", 0x800, 0x40 }, { "CTL3", 0x900, 0x40 }, { "CTL4", 0xa00, 0x40 },
++		/* the control blocks are at +0x1000/+0x1200/+0x1400 (the Linux driver's msm8x53 table); +0x600 is empty */
++		{ "CTL0", 0x1000, 0x60 }, { "CTL1", 0x1200, 0x60 }, { "CTL2", 0x1400, 0x60 },
++		/* the shared memory pool that feeds the pipes, to see which blocks the loader gave RGB0 */
++		{ "SMP", 0x180, 0x100 },
+ 		{ "LM0", 0x44000, 0x40 }, { "LM1", 0x45000, 0x40 },
+-		{ "RGB0", 0x14000, 0x40 }, { "RGB1", 0x16000, 0x40 }, { "DMA0", 0x24000, 0x40 }, { "VIG0", 0x4000, 0x40 },
++		{ "RGB0", 0x14000, 0x80 }, { "RGB1", 0x16000, 0x40 }, { "DMA0", 0x24000, 0x40 },
++		/* VIG0 has the scaler: its pixel-extension registers (+0x100) and scale registers (+0x200) */
++		{ "VIG0", 0x4000, 0x80 }, { "VIG0x", 0x4100, 0x40 }, { "VIG0s", 0x4200, 0x30 },
+ 		{ "INTF1", 0x6a800, 0x60 },
+ 	};
+ 	vm_offset_t va = ml_io_map(0x01a01000, 0x6c000);
+-- 
+2.43.0
+
