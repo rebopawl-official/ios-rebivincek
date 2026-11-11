@@ -1,0 +1,47 @@
+From cfa96ef75347f5c6bf4bc4bed0310acd9cc8a3f2 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 11 Nov 2026 22:05:48 +0000
+Subject: [PATCH] 1013 vince: vincemdpdump also prints the display clocks (GCC
+ MDSS block)
+
+The VIG0 test shows the first part of each frame and then the underflow colour, whether the
+picture is scaled or not, which points at the MDP clock or the bus. Read-only: the clocks
+the loader left, at 0x4d000-0x4d09f of the GCC.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ bsd/dev/vince_adreno.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
+index 44e124b..7c3d1a6 100644
+--- a/bsd/dev/vince_adreno.c
++++ b/bsd/dev/vince_adreno.c
+@@ -1081,6 +1081,23 @@ vince_mdp_dump(void)
+ 			printf("VINCE MDP: %s+%#x: %08x %08x %08x %08x\n", win[w].name, o, r[0], r[1], r[2], r[3]);
+ 		}
+ 	}
++	/*
++	 * The display clocks the boot loader left (GCC, MDSS block): pixel clock 0x4d000, MDP core clock 0x4d014 (CMD, CFG, M, N, D),
++	 * vsync 0x4d02c, byte clock 0x4d044, escape 0x4d05c, MDP clock gate 0x4d088 (offsets from the msm8953 clock driver).
++	 * The VIG0 test stops fetching part way down the frame (the rest is the underflow colour), so the MDP clock is suspect.
++	 */
++	if (!gcc_va) {
++		gcc_va = ml_io_map(GCC_BASE_PA, GCC_SIZE);
++	}
++	if (gcc_va) {
++		static const uint32_t gw[] = { 0x4d000, 0x4d010, 0x4d020, 0x4d040, 0x4d050, 0x4d080 };
++
++		for (w = 0; w < sizeof(gw) / sizeof(gw[0]); w++) {
++			volatile uint32_t *r = (volatile uint32_t *)(gcc_va + gw[w]);
++			printf("VINCE MDP: GCC+%#x: %08x %08x %08x %08x  +%#x: %08x %08x %08x %08x\n", gw[w], r[0], r[1], r[2], r[3],
++			    gw[w] + 0x10, r[4], r[5], r[6], r[7]);
++		}
++	}
+ }
+ 
+ /*
+-- 
+2.43.0
+
