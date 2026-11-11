@@ -1,0 +1,145 @@
+From 879aefabaf683483c26ef54ebd98337e80ec665f Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 11 Nov 2026 14:43:34 +0000
+Subject: [PATCH] 1009 vince: vinceflip=1 converts frames into a second panel
+ buffer and flips the MDP to it at vsync
+
+The panel was converted in place while the MDP scanned it, so half-finished frames showed. With
+vinceflip=1 the frame is converted into the buffer that is not scanned, RGB0's address is
+changed and CTL0 flushed (RGB0 and LM0), and the presenter waits until the MDP has taken it.
+The second buffer comes from the GPU pool, not the 8 MiB I/O submap.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 74 +++++++++++++++++++++++++--
+ 1 file changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 83ce179..e7ea22c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -245,6 +245,17 @@ public:
+ 	uint32_t      fVinceBlitUS;
+ 	bool          startVince(void);
+ 	void          blitVince(void);
++	/* vinceflip=1: two panel buffers (LK's and one from the GPU pool); frames are converted into the one not scanned and
++	 * the MDP is pointed at it (RGB0 address + CTL0 flush), which it takes at the next vertical blank */
++	SweetSurface *fBackSurf;
++	uintptr_t     fBackVA;
++	uint64_t      fBackPhys;
++	volatile uint32_t *fRgb0;     /* the MDP's RGB0 pipe, +0x14 is its address */
++	volatile uint32_t *fFlipCtl;  /* CTL0, +0x18 is its flush */
++	bool          fFlipOn;
++	bool          fShowBack;      /* the pool buffer is the one scanned */
++	uint32_t      fFlipSlow;      /* flips the MDP did not take within 40 ms */
++	void          vinceFlipTo(bool back);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+@@ -525,6 +536,35 @@ AppleCLCD::startVince(void)
+ 	fClients = OSArray::withCapacity(4);
+ 	fPanelSurf = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fPanelSurf != NULL ? fPanelSurf->kernelAddress() : 0;
++	{
++		uint32_t flip = 0;
++
++		(void)PE_parse_boot_argn("vinceflip", &flip, sizeof(flip));
++		if (flip && fPanelSurf != NULL) {
++			uint64_t take = round_page_64((uint64_t)fRowBytes * fHeight);
++			uint64_t pa = vince_pool_alloc(take);
++
++			fRgb0 = (volatile uint32_t *)ml_io_map(0x01a15000, 0x1000);
++			fFlipCtl = (volatile uint32_t *)ml_io_map(0x01a02000, 0x1000);
++			if (pa != 0) {
++				fBackSurf = sweet_surface_create_physical(pa, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++				fBackVA = fBackSurf != NULL ? fBackSurf->kernelAddress() : 0;
++			}
++			if (fBackVA != 0 && fRgb0 != NULL && fFlipCtl != NULL && fRgb0[0x14 / 4] == (uint32_t)VINCE_FB_PHYS) {
++				bzero((void *)fBackVA, (size_t)take);
++				__asm__ volatile ("dsb sy" ::: "memory");
++				fBackPhys = pa;
++				fFlipOn = true;
++				IOLog("VINCE FB: vinceflip on, second panel buffer at %#llx\n", (unsigned long long)pa);
++			} else {
++				IOLog("VINCE FB: vinceflip refused (pool %#llx map %#lx rgb0 %#x)\n", (unsigned long long)pa,
++				    (unsigned long)fBackVA, fRgb0 != NULL ? fRgb0[0x14 / 4] : 0);
++				if (pa != 0 && fBackSurf == NULL) {
++					vince_pool_free(pa, take);
++				}
++			}
++		}
++	}
+ 	fSurface = sweet_surface_create_buffer(fLogicalW, fLogicalH, SWEET_FB_FORMAT_BGRA);
+ 	fShadowVA = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fShadowStride = fSurface != NULL ? fSurface->bytesPerRow : fLogicalW * 4;
+@@ -581,7 +621,7 @@ AppleCLCD::blitVince(void)
+ {
+ 	const uint32_t *shadow = (const uint32_t *)fShadowVA;
+ 	uint32_t shadowRow = fShadowStride / 4;
+-	uint8_t *panel = (uint8_t *)fPixels;
++	uint8_t *panel = (uint8_t *)((fFlipOn && !fShowBack) ? fBackVA : fPixels);   /* the buffer not scanned */
+ 	uint64_t began = mach_absolute_time(), took;
+ 
+ 	if (fSurface != NULL && fSurface->vincePool) {
+@@ -599,10 +639,35 @@ AppleCLCD::blitVince(void)
+ 		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	if (fFlipOn) {
++		vinceFlipTo(!fShowBack);
++	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - began, &took);
+ 	fVinceBlitUS = (uint32_t)(took / 1000);
+ 	fVinceBlits++;
+ }
++
++/* point the MDP at one of the two panel buffers and wait until it has taken it (the next vertical blank) */
++void
++AppleCLCD::vinceFlipTo(bool back)
++{
++	uint32_t t;
++
++	if (!fFlipOn || back == fShowBack) {
++		return;
++	}
++	fRgb0[0x14 / 4] = (uint32_t)(back ? fBackPhys : VINCE_FB_PHYS);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fFlipCtl[0x18 / 4] = (1u << 3) | (1u << 6);     /* RGB0 and LM0 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (t = 0; t < 200 && (fFlipCtl[0x18 / 4] & ((1u << 3) | (1u << 6))) != 0; t++) {
++		IODelay(200);
++	}
++	if (t == 200) {
++		fFlipSlow++;
++	}
++	fShowBack = back;
++}
+ #endif /* VINCE */
+ 
+ void
+@@ -632,9 +697,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ #if defined(VINCE)
+ 	if (fb->fShadowVA != 0 && (count % 600) == 0) {
+ 		/* every 10 s: is iOS connected to the display and drawing into it? */
+-		IOLog("VINCE FB: %llu s: clients %u swaps begun %u shown %u (last %u us) display %s\n",
++		IOLog("VINCE FB: %llu s: clients %u swaps begun %u shown %u (last %u us) display %s, flips slow %u\n",
+ 		    count / 60, fb->fClients->getCount(), fb->fSwapID, fb->fVinceBlits, fb->fVinceBlitUS,
+-		    fb->fPowerOff ? "off" : "on");
++		    fb->fPowerOff ? "off" : "on", fb->fFlipSlow);
+ 	}
+ #endif
+ 	if (fb->fIntf1 != NULL && (count % 300) == 0) {
+@@ -651,6 +716,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fFadeStep = 1;
+ 			IOLockUnlock(fb->fLock);
+ 			if (first) {
++				if (fb->fFlipOn) {
++					fb->vinceFlipTo(false);       /* the loader's buffer again, which is the one cleared */
++				}
+ 				bzero((void *)fb->fPixels, (size_t)fb->fRowBytes * fb->fHeight);
+ 				__asm__ volatile ("dsb sy" ::: "memory");
+ 			}
+-- 
+2.43.0
+
