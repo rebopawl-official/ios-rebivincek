@@ -1,4 +1,4 @@
-From 2438ab3c19d031ce06d0f200117273101faa3539 Mon Sep 17 00:00:00 2001
+From a3f22fc3e9db80c4c8ab8a9fd23167318319e614 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Thu, 12 Nov 2026 12:54:25 +0000
 Subject: [PATCH] 1018 vince: vincezero=1 scans the window server's surface out
@@ -14,14 +14,24 @@ converted into the panel buffer as before.
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp | 158 +++++++++++++++++++++++++-
- 1 file changed, 156 insertions(+), 2 deletions(-)
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 161 +++++++++++++++++++++++++-
+ 1 file changed, 159 insertions(+), 2 deletions(-)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index b043424..2be8152 100644
+index b043424..12e56c1 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -257,6 +257,19 @@ public:
+@@ -148,6 +148,9 @@ enum {
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++/* defined below with the swap helpers; vinceZeroPresent() needs it earlier */
++static uint32_t get32(const uint8_t *p, uint32_t off);
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -257,6 +260,19 @@ public:
  	uint32_t      fFlipSlow;      /* flips the MDP did not take within 40 ms */
  	void          vinceFlipTo(bool back);
  	void          vinceVigTest(void);
@@ -41,7 +51,7 @@ index b043424..2be8152 100644
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
-@@ -540,7 +553,33 @@ AppleCLCD::startVince(void)
+@@ -540,7 +556,33 @@ AppleCLCD::startVince(void)
  	{
  		uint32_t flip = 0;
  
@@ -75,7 +85,7 @@ index b043424..2be8152 100644
  		if (flip && fPanelSurf != NULL) {
  			uint64_t take = round_page_64((uint64_t)fRowBytes * fHeight);
  			uint64_t pa = vince_pool_alloc(take);
-@@ -829,6 +868,95 @@ AppleCLCD::vinceVigTest(void)
+@@ -829,6 +871,95 @@ AppleCLCD::vinceVigTest(void)
  	IOLog("VINCE VIG TEST: done, flush read back %#x, layer %#x\n", ctl[0x18 / 4], ctl[0]);
  }
  
@@ -171,7 +181,7 @@ index b043424..2be8152 100644
  /* point the MDP at one of the two panel buffers and wait until it has taken it (the next vertical blank) */
  void
  AppleCLCD::vinceFlipTo(bool back)
-@@ -895,6 +1023,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -895,6 +1026,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (fb->fShadowVA != 0) {
  			/* vince: one black frame; the backlight is not ours to switch */
  			bool first = fb->fFadeStep == 0;
@@ -181,7 +191,7 @@ index b043424..2be8152 100644
  			fb->fFadeStep = 1;
  			IOLockUnlock(fb->fLock);
  			if (first) {
-@@ -1252,6 +1383,15 @@ AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
+@@ -1252,6 +1386,15 @@ AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
  			layer = layer < 0 ? (int)i : -2;
  		}
  	}
@@ -197,7 +207,7 @@ index b043424..2be8152 100644
  	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
  }
  
-@@ -1303,8 +1443,13 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+@@ -1303,8 +1446,13 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
  		sweet_hold_set(dropped, false);
  		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
  		present(rec);
@@ -213,7 +223,7 @@ index b043424..2be8152 100644
  		}
  		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
  		sweet_fps_wait_ns += wns;
-@@ -1721,6 +1866,15 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1721,6 +1869,15 @@ AppleCLCD::present(const uint8_t *rec)
  		return;
  	}
  	fConsShown = false;
