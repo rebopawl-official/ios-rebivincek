@@ -1,0 +1,73 @@
+From f5ede57b5691908fefdf1484b0a032267a8cffee Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 12 Nov 2026 09:29:49 +0000
+Subject: [PATCH] 1017 vince: vincevigtest follows the Linux driver's pixel
+ extension and scaler layouts
+
+Checked against the Linux mdp5 driver and its register database: SW_PIX_EXT_REQ_PIXELS has the
+left-right count in its low half and top-bottom in its high half (the test had them swapped, so
+a 1080x2160 picture asked for 2160 pixels of 1080 lines, half the screen, then the underflow
+colour; RGB1 and DMA0 asked for nothing). The pixel extension has three components, not four,
+with the right and bottom repeat counts at bits 16-23 (the test wrote them into the left
+field). SCALE_CONFIG has the filters at bits 8, 10, 16 and 18 (the test used 8, 12, 16, 20).
+The step unit goes back to 1<<21.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c995390..b043424 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -743,14 +743,13 @@ AppleCLCD::vinceVigTest(void)
+ 		}
+ 
+ 		vig[0x00 / 4] = (sh << 16) | sw;              /* SRC_SIZE */
+-		for (i = 0; i < 4; i++) {
+-			vig[(0x100 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? 0 : 0x1;                       /* SW_PIX_EXT_LR */
+-			vig[(0x104 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? 0 : 0x1;                       /* SW_PIX_EXT_TB */
+-			vig[(0x108 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? ((sw << 16) | sh) : (((sw + 1) << 16) | (sh + 1));   /* REQ_PIXELS */
++		for (i = 0; i < 3; i++) {       /* three components: 0, 1_2 and 3 (0x130 is something else) */
++			vig[(0x100 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? 0 : 0x10000;                   /* SW_PIX_EXT_LR: RIGHT_RPT (bits 16-23) = 1 */
++			vig[(0x104 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? 0 : 0x10000;                   /* SW_PIX_EXT_TB: BOTTOM_RPT = 1 */
++			vig[(0x108 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? ((sh << 16) | sw) : (((sh + 1) << 16) | (sw + 1));   /* REQ_PIXELS: TOP_BOTTOM above LEFT_RIGHT */
+ 		}
+-		/* the first scaled phase uses 1.0 = 1 << 21 (the Linux driver); the last 1.0 = 1 << 20, because the bands came out
+-		 * about twice as thin as they should, as if the hardware counted in 1 << 20 */
+-		uint32_t unit = ph == 2 ? 20 : 21;
++		/* 1.0 = 1 << 21, as the Linux driver has it */
++		uint32_t unit = 21;
+ 
+ 		vig[0x210 / 4] = (ph == 0 || ph == 3) ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * W / 1080);   /* SCALE_PHASE_STEP_X */
+ 		vig[0x214 / 4] = (ph == 0 || ph == 3) ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * H / 2160);   /* SCALE_PHASE_STEP_Y */
+@@ -759,9 +758,10 @@ AppleCLCD::vinceVigTest(void)
+ 		if (ph == 0 || ph == 3) {
+ 			vig[0x204 / 4] = 0;                       /* SCALE_CONFIG: off */
+ 		} else {
+-			uint32_t f = 2;                               /* the downscale filter */
++			uint32_t f = ph == 1 ? 2 : 0;             /* the downscale filter, then nearest */
+ 
+-			vig[0x204 / 4] = 0x3 | (f << 8) | (f << 12) | (f << 16) | (f << 20);
++			/* SCALEX_EN, SCALEY_EN, then the filters: x comp 0 at bit 8, y comp 0 at 10, x comp 3 at 16, y comp 3 at 18 */
++			vig[0x204 / 4] = 0x3 | (f << 8) | (f << 10) | (f << 16) | (f << 18);
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		IOLog("VINCE VIG TEST: phase %u: src %#x size %#x out %#x format %#x step x %#x y %#x config %#x\n", ph + 1,
+@@ -803,6 +803,11 @@ AppleCLCD::vinceVigTest(void)
+ 			pp[0x30 / 4] = 0x0002243f;
+ 			pp[0x34 / 4] = 0x00020001;
+ 			pp[0x38 / 4] = 0x80000000;
++			for (i = 0; i < 3; i++) {
++				pp[(0x100 + 0x10 * i) / 4] = 0;
++				pp[(0x104 + 0x10 * i) / 4] = 0;
++				pp[(0x108 + 0x10 * i) / 4] = (2160u << 16) | 1080u;   /* the pixels it must fetch */
++			}
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+ 			ctl[0] = pipes[k].layer;
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+-- 
+2.43.0
+
