@@ -1,0 +1,70 @@
+From 89be93485e8c388f7759f80ea79a5916cda7abbf Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 12 Nov 2026 08:44:40 +0000
+Subject: [PATCH] 1016 vince: vincevigtest phases 5 and 6 show the 24-bit
+ picture through RGB1 and DMA0
+
+Phase 4 (24 bits a pixel through VIG0, no scaler) stops at about half the screen just as the
+4-byte phases do, so memory bandwidth is not the cause. Phases 5 and 6 use the pipes without a
+scaler, RGB1 and DMA0, to tell a VIG0 problem from a problem of every pipe but the loader's RGB0.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 40 +++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b922184..c995390 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -775,6 +775,46 @@ AppleCLCD::vinceVigTest(void)
+ 		IOLog("VINCE VIG TEST: phase %u shown, flush read back %#x after %u us, layer %#x\n", ph + 1, ctl[0x18 / 4], t * 200, ctl[0]);
+ 		IOSleep(4000);
+ 	}
++	/*
++	 * Phases 5 and 6: the same 24-bit picture (still in the buffer from phase 4) through two other pipes without a scaler, RGB1 and
++	 * DMA0. If they show all eight bands the cut is something VIG0 specific; if they stop at about half the screen too, any pipe
++	 * but the loader's RGB0 does, and the pipe setup (clocks, bus ports) is what is missing.
++	 */
++	{
++		static const struct { uint32_t pa, layer, flush; const char *name; } pipes[2] = {
++			{ 0x01a17000, 0x1000, 0x10, "RGB1" },        /* MDP + 0x16000; layer RGB1 at base stage; flush bit 4 */
++			{ 0x01a25000, 0x40000, 0x800, "DMA0" },      /* MDP + 0x24000; layer DMA0; flush bit 11 */
++		};
++		uint32_t k;
++
++		for (k = 0; k < 2; k++) {
++			volatile uint32_t *pp = (volatile uint32_t *)ml_io_map(pipes[k].pa, 0x1000);
++
++			if (pp == NULL) {
++				continue;
++			}
++			pp[0x00 / 4] = (2160u << 16) | 1080u;
++			pp[0x04 / 4] = (2160u << 16) | 1080u;
++			pp[0x08 / 4] = 0;
++			pp[0x0c / 4] = (2160u << 16) | 1080u;
++			pp[0x10 / 4] = 0;
++			pp[0x14 / 4] = (uint32_t)pa;
++			pp[0x24 / 4] = 3240;
++			pp[0x30 / 4] = 0x0002243f;
++			pp[0x34 / 4] = 0x00020001;
++			pp[0x38 / 4] = 0x80000000;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			ctl[0] = pipes[k].layer;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			ctl[0x18 / 4] = 0x20000 | pipes[k].flush | (1u << 0) | (1u << 3) | (1u << 6);
++			for (t = 0; t < 200 && (ctl[0x18 / 4] & 0x41) != 0; t++) {
++				IODelay(200);
++			}
++			IOLog("VINCE VIG TEST: phase %u (%s, 24 bit) shown, flush read back %#x, layer %#x, pipe src %#x\n", 5 + k,
++			    pipes[k].name, ctl[0x18 / 4], ctl[0], pp[0x14 / 4]);
++			IOSleep(4000);
++		}
++	}
+ 	ctl[0] = 0x200;                                   /* RGB0 again */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	ctl[0x18 / 4] = 0x20000 | (1u << 0) | (1u << 3) | (1u << 6);
+-- 
+2.43.0
+
