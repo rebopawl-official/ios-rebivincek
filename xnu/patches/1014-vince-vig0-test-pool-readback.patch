@@ -1,0 +1,88 @@
+From 96e8218994aab98e7ae296a4b807f712b06abf7e Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 12 Nov 2026 07:54:31 +0000
+Subject: [PATCH] 1014 vince: vincevigtest=2 shows the picture from outside the
+ GPU pool, reads it back, and tries the scaler step in 1<<20 units
+
+The first scaled test and the unscaled one both stop at about 4.8 MB of the picture and fill
+the rest with the underflow colour, and the scaled bands are twice as thin as they should be.
+Mode 2 puts the picture in the loader's splash area to see if the pool address matters, the
+CPU reads a few pixels back to see if the memory holds the colours, and the last phase counts
+the scaler's phase step in 1<<20 units.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 31 +++++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 07debbe..5e16ec1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -669,15 +669,21 @@ AppleCLCD::vinceVigTest(void)
+ {
+ 	const uint32_t W = 1125, H = 2436, ROW = 4608;
+ 	uint64_t take = round_page_64((uint64_t)ROW * H);
+-	uint64_t pa = vince_pool_alloc(take);
++	uint32_t mode = 1;
++	uint64_t pa;
+ 	volatile uint32_t *vig = (volatile uint32_t *)ml_io_map(0x01a05000, 0x1000);      /* MDP + 0x4000: VIG0 */
+ 	volatile uint32_t *ctl = (volatile uint32_t *)ml_io_map(0x01a02000, 0x1000);      /* CTL0 */
+-	SweetSurface *surf = pa != 0 ? sweet_surface_create_physical(pa, W, H, ROW, SWEET_FB_FORMAT_BGRA) : NULL;
+-	uintptr_t va = surf != NULL ? surf->kernelAddress() : 0;
++	SweetSurface *surf;
++	uintptr_t va;
+ 	uint32_t i, t, y, x, ph;
+ 	const uint32_t bars[8] = { 0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu, 0xffffff00u, 0xff00ffffu, 0xffff00ffu,
+ 		0xff808080u };      /* B in the low byte */
+ 
++	(void)PE_parse_boot_argn("vincevigtest", &mode, sizeof(mode));
++	/* 1: the picture in the GPU's pool; 2: in the loader's reserved splash area (0x90801000), outside the pool */
++	pa = mode == 2 ? 0x90801000ull : vince_pool_alloc(take);
++	surf = pa != 0 ? sweet_surface_create_physical(pa, W, H, ROW, SWEET_FB_FORMAT_BGRA) : NULL;
++	va = surf != NULL ? surf->kernelAddress() : 0;
+ 	if (va == 0 || vig == NULL || ctl == NULL || ctl[0] != 0x200) {
+ 		IOLog("VINCE VIG TEST: not started (pool %#llx map %#lx ctl0 layer %#x)\n", (unsigned long long)pa, (unsigned long)va,
+ 		    ctl != NULL ? ctl[0] : 0);
+@@ -691,6 +697,15 @@ AppleCLCD::vinceVigTest(void)
+ 		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	/* what the CPU reads back from the buffer through the same uncached mapping: a few pixels down the picture */
++	{
++		static const uint32_t rows[6] = { 100, 700, 1000, 1100, 1500, 2300 };
++
++		for (i = 0; i < 6; i++) {
++			IOLog("VINCE VIG TEST: mode %u row %u reads %#x (written %#x)\n", mode, rows[i],
++			    ((uint32_t *)(va + (uint64_t)rows[i] * ROW))[500], bars[rows[i] * 8 / H]);
++		}
++	}
+ 	vig[0x04 / 4] = (H << 16) | W;                    /* SRC_IMG_SIZE */
+ 	vig[0x08 / 4] = 0;                                /* SRC_XY */
+ 	vig[0x0c / 4] = (2160u << 16) | 1080u;            /* OUT_SIZE */
+@@ -709,14 +724,18 @@ AppleCLCD::vinceVigTest(void)
+ 			vig[(0x104 + 0x10 * i) / 4] = ph == 0 ? 0 : 0x1;                       /* SW_PIX_EXT_TB */
+ 			vig[(0x108 + 0x10 * i) / 4] = ph == 0 ? ((sw << 16) | sh) : (((sw + 1) << 16) | (sh + 1));   /* REQ_PIXELS */
+ 		}
+-		vig[0x210 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << 21) * W / 1080);   /* SCALE_PHASE_STEP_X */
+-		vig[0x214 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << 21) * H / 2160);   /* SCALE_PHASE_STEP_Y */
++		/* the first scaled phase uses 1.0 = 1 << 21 (the Linux driver); the last 1.0 = 1 << 20, because the bands came out
++		 * about twice as thin as they should, as if the hardware counted in 1 << 20 */
++		uint32_t unit = ph == 2 ? 20 : 21;
++
++		vig[0x210 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * W / 1080);   /* SCALE_PHASE_STEP_X */
++		vig[0x214 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * H / 2160);   /* SCALE_PHASE_STEP_Y */
+ 		vig[0x218 / 4] = vig[0x210 / 4];
+ 		vig[0x21c / 4] = vig[0x214 / 4];
+ 		if (ph == 0) {
+ 			vig[0x204 / 4] = 0;                       /* SCALE_CONFIG: off */
+ 		} else {
+-			uint32_t f = ph == 1 ? 0 : 2;             /* nearest, then the downscale filter */
++			uint32_t f = 2;                               /* the downscale filter */
+ 
+ 			vig[0x204 / 4] = 0x3 | (f << 8) | (f << 12) | (f << 16) | (f << 20);
+ 		}
+-- 
+2.43.0
+
