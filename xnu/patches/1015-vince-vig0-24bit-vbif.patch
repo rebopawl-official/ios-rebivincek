@@ -1,0 +1,110 @@
+From 667ff2172052e14684cfb4e46cfb22b48d1bccc2 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 12 Nov 2026 08:14:33 +0000
+Subject: [PATCH] 1015 vince: vincevigtest gets a fourth phase with 24 bits a
+ pixel, vincemdpdump prints the VBIF
+
+The scaled and unscaled 4-byte phases all stop part way and fill the rest with the underflow
+colour, and the stop comes sooner the more the scaler has to read, whether the picture is in the
+pool or not. That looks like the pipe being starved of memory bandwidth. Phase 4 scans out
+24 bits a pixel through VIG0 like RGB0 does, and the VBIF dump shows the read limits and halts.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ bsd/dev/vince_adreno.c                | 17 ++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 40 +++++++++++++++++++++------
+ 2 files changed, 49 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
+index 7c3d1a6..d1cc1ce 100644
+--- a/bsd/dev/vince_adreno.c
++++ b/bsd/dev/vince_adreno.c
+@@ -1081,6 +1081,23 @@ vince_mdp_dump(void)
+ 			printf("VINCE MDP: %s+%#x: %08x %08x %08x %08x\n", win[w].name, o, r[0], r[1], r[2], r[3]);
+ 		}
+ 	}
++	/*
++	 * The MDP's bus interface (VBIF, 0x01ab0000 in the msm8953 device tree, 0x1040 long): outstanding-request limits and the
++	 * halt controls per client, which decide how fast each pipe can read memory. The loader may have set only RGB0's.
++	 */
++	{
++		vm_offset_t vb = ml_io_map(0x01ab0000, 0x1040);
++
++		if (vb) {
++			for (o = 0; o < 0x400; o += 0x10) {
++				volatile uint32_t *r = (volatile uint32_t *)(vb + o);
++
++				if (r[0] || r[1] || r[2] || r[3]) {
++					printf("VINCE MDP: VBIF+%#x: %08x %08x %08x %08x\n", o, r[0], r[1], r[2], r[3]);
++				}
++			}
++		}
++	}
+ 	/*
+ 	 * The display clocks the boot loader left (GCC, MDSS block): pixel clock 0x4d000, MDP core clock 0x4d014 (CMD, CFG, M, N, D),
+ 	 * vsync 0x4d02c, byte clock 0x4d044, escape 0x4d05c, MDP clock gate 0x4d088 (offsets from the msm8953 clock driver).
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5e16ec1..b922184 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -715,24 +715,48 @@ AppleCLCD::vinceVigTest(void)
+ 	vig[0x30 / 4] = 0x36ff;                           /* FORMAT: 4 x 8 bits, 4 bytes, 4 elements, no alpha blend */
+ 	vig[0x34 / 4] = 0x03020001;                       /* UNPACK: B, G, R, A */
+ 	vig[0x38 / 4] = 0x80000000;                       /* OP_MODE: software pixel extension */
+-	for (ph = 0; ph < 3; ph++) {
+-		uint32_t sw = ph == 0 ? 1080 : W, sh = ph == 0 ? 2160 : H;
++	for (ph = 0; ph < 4; ph++) {
++		uint32_t sw = (ph == 0 || ph == 3) ? 1080 : W, sh = (ph == 0 || ph == 3) ? 2160 : H;
++
++		if (ph == 3) {
++			/*
++			 * The same pipe, no scaling, but 24 bits a pixel like the loader's own RGB0 picture (3 bytes B, G, R, rows of 3240):
++			 * if this shows all eight bands the pipe works and the memory is too slow for 4 bytes a pixel (or for the scaler's
++			 * rereading); if it also stops at about half the screen the pipe's setup is at fault.
++			 */
++			for (y = 0; y < 2160; y++) {
++				uint8_t *row = (uint8_t *)(va + (uint64_t)y * 3240);
++
++				for (x = 0; x < 1080; x++) {
++					uint32_t c = (x < 8 || x >= 1072 || y < 8 || y >= 2152) ? 0xff000000u : bars[y * 8 / 2160];
++
++					row[x * 3] = (uint8_t)c;
++					row[x * 3 + 1] = (uint8_t)(c >> 8);
++					row[x * 3 + 2] = (uint8_t)(c >> 16);
++				}
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			vig[0x04 / 4] = (2160u << 16) | 1080u;
++			vig[0x24 / 4] = 3240;
++			vig[0x30 / 4] = 0x0002243f;               /* the format RGB0 has */
++			vig[0x34 / 4] = 0x00020001;
++		}
+ 
+ 		vig[0x00 / 4] = (sh << 16) | sw;              /* SRC_SIZE */
+ 		for (i = 0; i < 4; i++) {
+-			vig[(0x100 + 0x10 * i) / 4] = ph == 0 ? 0 : 0x1;                       /* SW_PIX_EXT_LR */
+-			vig[(0x104 + 0x10 * i) / 4] = ph == 0 ? 0 : 0x1;                       /* SW_PIX_EXT_TB */
+-			vig[(0x108 + 0x10 * i) / 4] = ph == 0 ? ((sw << 16) | sh) : (((sw + 1) << 16) | (sh + 1));   /* REQ_PIXELS */
++			vig[(0x100 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? 0 : 0x1;                       /* SW_PIX_EXT_LR */
++			vig[(0x104 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? 0 : 0x1;                       /* SW_PIX_EXT_TB */
++			vig[(0x108 + 0x10 * i) / 4] = (ph == 0 || ph == 3) ? ((sw << 16) | sh) : (((sw + 1) << 16) | (sh + 1));   /* REQ_PIXELS */
+ 		}
+ 		/* the first scaled phase uses 1.0 = 1 << 21 (the Linux driver); the last 1.0 = 1 << 20, because the bands came out
+ 		 * about twice as thin as they should, as if the hardware counted in 1 << 20 */
+ 		uint32_t unit = ph == 2 ? 20 : 21;
+ 
+-		vig[0x210 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * W / 1080);   /* SCALE_PHASE_STEP_X */
+-		vig[0x214 / 4] = ph == 0 ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * H / 2160);   /* SCALE_PHASE_STEP_Y */
++		vig[0x210 / 4] = (ph == 0 || ph == 3) ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * W / 1080);   /* SCALE_PHASE_STEP_X */
++		vig[0x214 / 4] = (ph == 0 || ph == 3) ? 0x200000 : (uint32_t)(((uint64_t)1 << unit) * H / 2160);   /* SCALE_PHASE_STEP_Y */
+ 		vig[0x218 / 4] = vig[0x210 / 4];
+ 		vig[0x21c / 4] = vig[0x214 / 4];
+-		if (ph == 0) {
++		if (ph == 0 || ph == 3) {
+ 			vig[0x204 / 4] = 0;                       /* SCALE_CONFIG: off */
+ 		} else {
+ 			uint32_t f = 2;                               /* the downscale filter */
+-- 
+2.43.0
+
