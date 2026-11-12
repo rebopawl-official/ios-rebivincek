@@ -1,0 +1,234 @@
+From 2438ab3c19d031ce06d0f200117273101faa3539 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 12 Nov 2026 12:54:25 +0000
+Subject: [PATCH] 1018 vince: vincezero=1 scans the window server's surface out
+ through VIG0 without copying it
+
+The MDP's VIG0 pipe scales 1125x2436 to the panel's 1080x2160 (tested with vincevigtest and
+checked against the Linux mdp5 driver: pixel extension, scaler, flush bits). With vincezero=1 a
+frame that is one screen-sized surface from the GPU pool is shown by pointing VIG0 at it and
+flushing CTL0 (the MDP takes it at the next vsync); the surface is held until then. Any other
+frame (several layers, console, display off) switches CTL0 back to RGB0 and is composed and
+converted into the panel buffer as before.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 158 +++++++++++++++++++++++++-
+ 1 file changed, 156 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b043424..2be8152 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -257,6 +257,19 @@ public:
+ 	uint32_t      fFlipSlow;      /* flips the MDP did not take within 40 ms */
+ 	void          vinceFlipTo(bool back);
+ 	void          vinceVigTest(void);
++	/*
++	 * vincezero=1: the window server's screen-sized surface from the GPU pool is scanned out by the MDP's VIG0 pipe, which
++	 * scales its 1125x2436 to the panel's 1080x2160 (no CPU copy); other frames go the old way through RGB0.
++	 */
++	volatile uint32_t *fZVig;     /* VIG0 (MDP + 0x4000) */
++	volatile uint32_t *fZCtl;     /* CTL0 (MDP + 0x1000) */
++	bool          fZero;          /* enabled */
++	bool          fZeroOnVig;     /* CTL0's layer is VIG0, not RGB0 */
++	uint32_t      fZeroStride;    /* what VIG0 is programmed for (0: not yet) */
++	uint32_t      fZeroFrames, fZeroSlow;
++	bool          vinceZeroPresent(const uint8_t *rec);
++	void          vinceZeroLayer(bool vig);
++	void          vinceZeroProgram(uint32_t stride);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+@@ -540,7 +553,33 @@ AppleCLCD::startVince(void)
+ 	{
+ 		uint32_t flip = 0;
+ 
++		uint32_t zero = 0;
++
+ 		(void)PE_parse_boot_argn("vinceflip", &flip, sizeof(flip));
++		(void)PE_parse_boot_argn("vincezero", &zero, sizeof(zero));
++		if (zero && fPanelSurf != NULL) {
++			fZVig = (volatile uint32_t *)ml_io_map(0x01a05000, 0x1000);
++			fZCtl = (volatile uint32_t *)ml_io_map(0x01a02000, 0x1000);
++			if (fZVig != NULL && fZCtl != NULL && fZCtl[0] == 0x200) {
++				uint32_t sync = 0;
++
++				fZero = true;
++				flip = 0;
++				IOLog("VINCE FB: vincezero on: the window server's surface is scanned out by VIG0\n");
++				if (!(PE_parse_boot_argn("sweetfb_sync", &sync, sizeof(sync)) && sync != 0) && (fQLock = IOLockAlloc()) != NULL) {
++					thread_t thread;
++
++					if (kernel_thread_start(&AppleCLCD::presenterMain, this, &thread) == KERN_SUCCESS) {
++						thread_deallocate(thread);
++					} else {
++						IOLockFree(fQLock);
++						fQLock = NULL;
++					}
++				}
++			} else {
++				IOLog("VINCE FB: vincezero refused (ctl0 layer %#x)\n", fZCtl != NULL ? fZCtl[0] : 0);
++			}
++		}
+ 		if (flip && fPanelSurf != NULL) {
+ 			uint64_t take = round_page_64((uint64_t)fRowBytes * fHeight);
+ 			uint64_t pa = vince_pool_alloc(take);
+@@ -829,6 +868,95 @@ AppleCLCD::vinceVigTest(void)
+ 	IOLog("VINCE VIG TEST: done, flush read back %#x, layer %#x\n", ctl[0x18 / 4], ctl[0]);
+ }
+ 
++/* CTL0's base layer: VIG0 (1) or RGB0 (0x200); the flush takes it at the next vertical blank and the old pipe's bit stays set */
++void
++AppleCLCD::vinceZeroLayer(bool vig)
++{
++	uint32_t t, mask = vig ? 0x41 : 0x48;
++
++	if (fZVig == NULL || fZCtl == NULL || fZeroOnVig == vig) {
++		return;
++	}
++	fZCtl[0] = vig ? 0x1 : 0x200;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fZCtl[0x18 / 4] = 0x20000 | (1u << 0) | (1u << 3) | (1u << 6);       /* CTL, VIG0, RGB0, LM0 */
++	for (t = 0; t < 200 && (fZCtl[0x18 / 4] & mask) != 0; t++) {
++		IODelay(200);
++	}
++	fZeroOnVig = vig;
++}
++
++/* what is fixed for a screen: sizes, format, scaler (numbers and bit layouts from the Linux mdp5 driver, as tested by vincevigtest) */
++void
++AppleCLCD::vinceZeroProgram(uint32_t stride)
++{
++	uint32_t i, w = fLogicalW, h = fLogicalH;
++
++	fZVig[0x00 / 4] = (h << 16) | w;                  /* SRC_SIZE */
++	fZVig[0x04 / 4] = (h << 16) | w;                  /* SRC_IMG_SIZE */
++	fZVig[0x08 / 4] = 0;                              /* SRC_XY */
++	fZVig[0x0c / 4] = (fHeight << 16) | fWidth;       /* OUT_SIZE */
++	fZVig[0x10 / 4] = 0;                              /* OUT_XY */
++	fZVig[0x24 / 4] = stride;                         /* SRC_STRIDE_A */
++	fZVig[0x30 / 4] = 0x36ff;                         /* FORMAT: 4 x 8 bits, 4 bytes, 4 elements, no alpha blend */
++	fZVig[0x34 / 4] = 0x03020001;                     /* UNPACK: B, G, R, A */
++	fZVig[0x38 / 4] = 0x80000000;                     /* OP_MODE: software pixel extension */
++	for (i = 0; i < 3; i++) {
++		fZVig[(0x100 + 0x10 * i) / 4] = 0x10000;                              /* LR: RIGHT_RPT 1 */
++		fZVig[(0x104 + 0x10 * i) / 4] = 0x10000;                              /* TB: BOTTOM_RPT 1 */
++		fZVig[(0x108 + 0x10 * i) / 4] = ((h + 1) << 16) | (w + 1);            /* REQ_PIXELS: top-bottom above left-right */
++	}
++	fZVig[0x210 / 4] = (uint32_t)(((uint64_t)1 << 21) * w / fWidth);      /* SCALE_PHASE_STEP_X */
++	fZVig[0x214 / 4] = (uint32_t)(((uint64_t)1 << 21) * h / fHeight);     /* SCALE_PHASE_STEP_Y */
++	fZVig[0x218 / 4] = fZVig[0x210 / 4];
++	fZVig[0x21c / 4] = fZVig[0x214 / 4];
++	fZVig[0x204 / 4] = 0x3 | (2u << 8) | (2u << 10) | (2u << 16) | (2u << 18);   /* both ways, the downscale filter */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fZeroStride = stride;
++}
++
++/* the frame is one screen-sized surface of the pool (directEligible): point VIG0 at it and let the MDP take it at the next vsync */
++bool
++AppleCLCD::vinceZeroPresent(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104), layer = 32, n = 0;
++
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			layer = i;
++			n++;
++		}
++	}
++	if (n != 1) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	bool ok = false;
++
++	if (s != NULL && s->vincePool && s->width == fLogicalW && s->height == fLogicalH && s->bytesPerElement == 4 &&
++	    s->offset == 0 && (s->poolPhys & 0xf) == 0 && s->bytesPerRow >= fLogicalW * 4 && s->bytesPerRow < 0x10000) {
++		vince_surface_sync(s);          /* the GPU is done with it, and none of it is left in the CPU's cache */
++		if (fZeroStride != s->bytesPerRow) {
++			vinceZeroProgram(s->bytesPerRow);
++		}
++		fZVig[0x14 / 4] = (uint32_t)s->poolPhys;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (!fZeroOnVig) {
++			vinceZeroLayer(true);
++		}
++		fZCtl[0x18 / 4] = 0x20000 | (1u << 0) | (1u << 6);               /* CTL, VIG0, LM0: latched at the next vsync */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if ((++fZeroFrames % 600) == 0) {
++			IOLog("VINCE FB: %u frames scanned out directly\n", fZeroFrames);
++		}
++		ok = true;
++	}
++	if (s != NULL) {
++		s->release();
++	}
++	return ok;
++}
++
+ /* point the MDP at one of the two panel buffers and wait until it has taken it (the next vertical blank) */
+ void
+ AppleCLCD::vinceFlipTo(bool back)
+@@ -895,6 +1023,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (fb->fShadowVA != 0) {
+ 			/* vince: one black frame; the backlight is not ours to switch */
+ 			bool first = fb->fFadeStep == 0;
++			if (fb->fZero) {
++				fb->vinceZeroLayer(false);
++			}
+ 			fb->fFadeStep = 1;
+ 			IOLockUnlock(fb->fLock);
+ 			if (first) {
+@@ -1252,6 +1383,15 @@ AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
++	if (layer >= 0 && held[layer] != NULL && fZero && held[layer]->vincePool && !fPowerOff && !fConsShown) {
++		SweetSurface *s = held[layer];
++
++		/* the window server's screen-sized surface, in whole, from the top left */
++		return s->width == fLogicalW && s->height == fLogicalH && s->bytesPerElement == 4 && s->offset == 0 &&
++		       (s->poolPhys & 0xf) == 0 && s->bytesPerRow >= fLogicalW * 4 && s->bytesPerRow < 0x10000 &&
++		       get32(rec, 0x64 + 16 * layer) == 0 && get32(rec, 0x64 + 16 * layer + 4) == 0 &&
++		       get32(rec, 0xc4 + 16 * layer) == 0 && get32(rec, 0xc4 + 16 * layer + 4) == 0;
++	}
+ 	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
+ }
+ 
+@@ -1303,8 +1443,13 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		present(rec);
+-		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
+-			IODelay(100);                           /* until the MDP has latched it */
++		{
++			volatile uint32_t *flushReg = fZero ? &fZCtl[0x18 / 4] : &fCtl0[0x18 / 4];
++			uint32_t flushMask = fZero ? 0x20041 : 0x20001;
++
++			for (int t = 0; t < 250 && (*flushReg & flushMask) != 0; t++) {
++				IODelay(100);                       /* until the MDP has latched it */
++			}
+ 		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
+ 		sweet_fps_wait_ns += wns;
+@@ -1721,6 +1866,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		return;
+ 	}
+ 	fConsShown = false;
++#if defined(VINCE)
++	if (fZero) {
++		if (vinceZeroPresent(rec)) {
++			fConsolePaused = true;
++			return;
++		}
++		vinceZeroLayer(false);          /* everything else is composed and converted into the panel buffer (RGB0) */
++	}
++#endif
+ 	if (directPresent(rec)) {
+ 		if (!fConsolePaused) {
+ 			int quiet = 0;
+-- 
+2.43.0
+
