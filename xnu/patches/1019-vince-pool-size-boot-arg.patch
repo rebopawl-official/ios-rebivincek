@@ -1,0 +1,122 @@
+From 37eb4e4c922f60c477e9e4775b562386f9e84055 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Fri, 13 Nov 2026 07:18:16 +0000
+Subject: [PATCH] 1019 vince: vincepoolmb=N sets the size of the GPU buffer
+ pool
+
+The pool the Adreno 506 buffers come from was fixed at 192 MiB (0x73c00000..0x7fc00000) and ran
+out after about 175 s of use: 179 of 192 MiB given out, the largest free piece 6 MiB, a 10 MiB
+GEM_NEW failed, and every GL call after that returned 0x505/0x506 (vanishing text, black Control
+Center). With vincepoolmb=N (192..448, rounded down to an even number, default 192 = unchanged)
+the pool grows downwards: it takes N MiB just below the driver's 4 MiB, the same amount less RAM
+is managed by the VM (arm_vm_init), and VinceGPU reads the pool's address and size from there
+instead of hard-coded constants, so the two cannot disagree. The pool's address and size are
+logged when it is first used. The range below 0x73c00000 is ordinary RAM for the OS (the phone's
+/proc/iomem lists System RAM 0x10000000-0x849fffff; the mainline vince device tree has no
+reserved region below 0x84a00000).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/VinceGPU.cpp | 11 +++++++----
+ osfmk/arm64/arm_vm_init.c     | 27 ++++++++++++++++++++-------
+ 2 files changed, 27 insertions(+), 11 deletions(-)
+
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index 7de5b31..729dc9c 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -26,6 +26,7 @@
+ extern "C" {
+ uint64_t kvtophys(vm_offset_t va);
+ void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: dc civac */
++extern uint64_t vince_pool_pa, vince_pool_size;        /* osfmk/arm64/arm_vm_init.c: 192 MiB, or vincepoolmb */
+ bool vince_gpu_ready(void);
+ bool vince_gpu_parameter(uint32_t which, uint64_t *value);
+ uint32_t vince_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+@@ -175,10 +176,11 @@ cacheSync(struct gpu_buffer *b)
+  * The pool GEM_NEW buffers come from. The GPU runs on from the first physical address of a buffer (no IOMMU), so a
+  * buffer has to be one piece, and RAM that has been in use for a while has no 12 MiB pieces left (the window server
+  * wants one for every frame). So a part of RAM is kept out of the VM for it (osfmk/arm64/arm_vm_init.c: the range
+- * just below the 4 MiB of bsd/dev/vince_adreno.c; the two must agree) and handed out here in 4 KiB units, first fit.
++ * just below the 4 MiB of bsd/dev/vince_adreno.c; its address and size come from there) and handed out here in
++ * 4 KiB units, first fit.
+  */
+-#define GPU_POOL_PA     0x73c00000ull
+-#define GPU_POOL_SIZE   0x0c000000ull
++#define GPU_POOL_PA     vince_pool_pa
++#define GPU_POOL_SIZE   vince_pool_size
+ #define GPU_POOL_UNIT   4096ull
+ #define GPU_POOL_UNITS  (GPU_POOL_SIZE / GPU_POOL_UNIT)
+ 
+@@ -217,6 +219,7 @@ poolAllocLocked(uint64_t size, bool top)
+ 		if (gPoolBits == NULL) {
+ 			return 0;
+ 		}
++		IOLog("VinceGPU: pool %llu MiB at %#llx\n", (unsigned long long)(GPU_POOL_SIZE >> 20), (unsigned long long)GPU_POOL_PA);
+ 	}
+ 	if (need == 0) {
+ 		return 0;
+@@ -424,7 +427,7 @@ vince_pool_alloc(uint64_t size)
+ 		return 0;
+ 	}
+ 	IOLockLock(gPoolLock);
+-	/* the buffers of the library need room too: the screens take at most 8 of the 192 MiB's 12 */
++	/* the buffers of the library need room too: the screens take at most 8 of the pool's 11 MiB pieces */
+ 	if (gPlaceHeld < 8) {
+ 		pa = poolAllocLocked(size, true);
+ 		if (pa != 0) {
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index d98b59f..38ad94d 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -350,6 +350,12 @@ SECURITY_READ_ONLY_LATE(unsigned long)   real_phys_size;
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)    vince_gap_start;
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)    vince_gap_end;
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)    vince_bank2_size;
++/*
++ * vince: the pool the GPU's buffers come from (iokit/Kernel/arm/VinceGPU.cpp): 192 MiB ending 4 MiB below the end of
++ * the loader's first bank, 0x7fc00000; boot-arg vincepoolmb=N makes it N MiB, taken from the RAM just below it.
++ */
++SECURITY_READ_ONLY_LATE(uint64_t)        vince_pool_pa = 0x73c00000ULL;
++SECURITY_READ_ONLY_LATE(uint64_t)        vince_pool_size = 0x0c000000ULL;
+ SECURITY_READ_ONLY_LATE(vm_map_address_t) physmap_base = (vm_map_address_t)0;
+ SECURITY_READ_ONLY_LATE(vm_map_address_t) physmap_end = (vm_map_address_t)0;
+ 
+@@ -1938,19 +1944,26 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	/*
+ 	 * Keep the top of the RAM the loader hands over out of the VM: its last 4 MiB are the Adreno 506 driver's
+ 	 * (bsd/dev/vince_adreno.c, GPU_MEM_PA 0x7fc00000; it maps that range itself and gives part of it to TrustZone:
+-	 * a page the VM owns and a kernel mapping of it at the same time is a panic, pmap_assert_free), and the 192 MiB
+-	 * below them are the pool the buffers of the GPU come from (iokit/Kernel/arm/VinceGPU.cpp, GPU_POOL_PA
++	 * a page the VM owns and a kernel mapping of it at the same time is a panic, pmap_assert_free), and the 192 MiB (more with
++	 * vincepoolmb) below them are the pool the buffers of the GPU come from (iokit/Kernel/arm/VinceGPU.cpp, GPU_POOL_PA
+ 	 * 0x73c00000): the GPU needs every buffer in one piece of physical memory and the VM has none that big.
+ 	 */
+ 	if (args->memSize > 0x30000000ULL) {
+-		args->memSize -= 0xc400000ULL;
+-		if (args->memSizeActual != 0 && args->memSizeActual > 0xc400000ULL) {
+-			args->memSizeActual -= 0xc400000ULL;
++		int poolmb = 192;
++		if (PE_parse_boot_argn("vincepoolmb", &poolmb, sizeof(poolmb))) {
++			poolmb = poolmb < 192 ? 192 : (poolmb > 448 ? 448 : (poolmb & ~1));     /* (even: the pool starts on a 2 MiB boundary) */
++		}
++		vince_pool_size = (uint64_t)poolmb << 20;
++		vince_pool_pa = 0x7fc00000ULL - vince_pool_size;
++		const uint64_t carve = vince_pool_size + 0x400000ULL;
++		args->memSize -= carve;
++		if (args->memSizeActual != 0 && args->memSizeActual > carve) {
++			args->memSizeActual -= carve;
+ 		}
+-		/* the standard layout only: bank 1 ends at 0x73c00000, bank 2 is 0xa0000000..0xffffffff */
++		/* the standard layout only: bank 1 ends where the pool starts, bank 2 is 0xa0000000..0xffffffff */
+ 		int ram3g = 0;
+ 		if (PE_parse_boot_argn("vinceram3g", &ram3g, sizeof(ram3g)) && ram3g != 0 &&
+-		    (gPhysBase + args->memSize) == 0x73c00000ULL) {
++		    (gPhysBase + args->memSize) == vince_pool_pa) {
+ 			vince_gap_start = gPhysBase + args->memSize;
+ 			vince_gap_end = 0xa0000000ULL;
+ 			vince_bank2_size = 0x60000000ULL;
+-- 
+2.43.0
+
