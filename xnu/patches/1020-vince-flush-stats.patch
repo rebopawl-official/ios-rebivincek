@@ -1,0 +1,124 @@
+From a3ba0a2a8bd085e6b48998cf831ebae80c42d4a4 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Fri, 13 Nov 2026 12:05:47 +0000
+Subject: [PATCH] 1020 vince: vineflushstats=1 times the cache cleaning and
+ fence waits
+
+A frame of the window server spends ~43 ms, ~17 ms of it "waiting" for the GPU even for a frame of
+6 small draws, and raising the GPU clock from ~267 to ~400 MHz (vincegpucfg=0x501) changed nothing,
+so the wait is probably not the GPU itself. Every submit cleans and invalidates the processor's cache
+for the whole of every buffer it names (an 11 MiB screen = ~170000 dc civac), under the driver lock,
+and the display does the same for the picture it scans; the fence is polled with IOSleep(1).
+With vineflushstats=1 the driver logs, every 10 s, the calls, MiB and time of the cache cleaning
+(submits and reads), of the display's cleaning, and of the fence waits (with their polls). It only
+counts; nothing else changes. Off by default.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/VinceGPU.cpp | 57 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index 729dc9c..b1f0f27 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -139,6 +139,54 @@ static uint32_t gSeq = 0;               /* GEM_NEWs so far (under gGPULock) */
+ static bool gFallbackDead = false;      /* RAM outside the pool has had no 1 MiB piece: it is not asked again */
+ 
+ 
++/*
++ * vineflushstats=1: every 10 s, how much time the kernel spent in the three places that make a frame wait: the
++ * cleaning of the processor's cache for the buffers of a submit or a read (cacheSync), the same for the picture the
++ * display is about to scan (vince_surface_sync), and the waits for the GPU's fence (gpuWait, which polls every
++ * millisecond). Counts only; nothing else changes.
++ */
++enum { kStatCache, kStatDisplay, kStatWait, kStatKinds };
++static struct { uint64_t calls, bytes, ns, polls; } gStat[kStatKinds];
++static uint64_t gStatNext, gStatPeriod;
++
++static bool
++statsOn(void)
++{
++	static int mode = -1;
++	if (mode < 0) {
++		uint32_t v = 0;
++		mode = (PE_parse_boot_argn("vineflushstats", &v, sizeof(v)) && v) ? 1 : 0;
++		nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &gStatPeriod);
++	}
++	return mode == 1;
++}
++
++static void
++statNote(int kind, uint64_t bytes, uint64_t started, uint64_t polls)
++{
++	uint64_t now = mach_absolute_time(), ns;
++
++	if (!statsOn()) {
++		return;
++	}
++	absolutetime_to_nanoseconds(now - started, &ns);
++	gStat[kind].calls++;
++	gStat[kind].bytes += bytes;
++	gStat[kind].ns += ns;
++	gStat[kind].polls += polls;
++	if (gStatNext == 0) {
++		gStatNext = now + gStatPeriod;
++	} else if (now >= gStatNext) {
++		gStatNext = now + gStatPeriod;
++		IOLog("VinceGPU: 10 s: cache clean for submits/reads %llu x %llu MiB %llu ms; display clean %llu x %llu MiB %llu ms; "
++		    "fence waits %llu x %llu ms (%llu polls)\n",
++		    gStat[kStatCache].calls, gStat[kStatCache].bytes >> 20, gStat[kStatCache].ns / NSEC_PER_MSEC,
++		    gStat[kStatDisplay].calls, gStat[kStatDisplay].bytes >> 20, gStat[kStatDisplay].ns / NSEC_PER_MSEC,
++		    gStat[kStatWait].calls, gStat[kStatWait].ns / NSEC_PER_MSEC, gStat[kStatWait].polls);
++		bzero(gStat, sizeof(gStat));
++	}
++}
++
+ /*
+  * vincecache=1: the buffers of the pool are mapped to the window server as ordinary cached memory instead of
+  * write-combined (reading write-combined memory is ~70 MB/s). The GPU does not snoop the CPU caches, so the kernel
+@@ -169,7 +217,9 @@ cacheSync(struct gpu_buffer *b)
+ 			return;
+ 		}
+ 	}
++	uint64_t started = mach_absolute_time();
+ 	sweet_dcache_flush((vm_offset_t)b->kmap->getVirtualAddress(), (unsigned)b->size);
++	statNote(kStatCache, b->size, started, 0);
+ }
+ 
+ /*
+@@ -329,16 +379,19 @@ static void VinceGPUSelfTest(void);
+ static bool
+ gpuWait(uint32_t fence, int64_t patienceMs)
+ {
+-	uint64_t start = mach_absolute_time();
++	uint64_t start = mach_absolute_time(), polls = 0;
+ 	while (!vince_gpu_done(fence)) {
+ 		uint64_t elapsedNs, elapsedMs;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsedNs);
+ 		elapsedMs = elapsedNs / NSEC_PER_MSEC;
+ 		if ((int64_t)elapsedMs >= patienceMs) {
++			statNote(kStatWait, 0, start, polls);
+ 			return vince_gpu_done(fence);
+ 		}
++		polls++;
+ 		IOSleep(1);
+ 	}
++	statNote(kStatWait, 0, start, polls);
+ 	return true;
+ }
+ 
+@@ -473,7 +526,9 @@ vince_surface_sync(SweetSurface *s)
+ 	}
+ 	va = s->kernelAddress();
+ 	if (va != 0) {
++		uint64_t started = mach_absolute_time();
+ 		sweet_dcache_flush((vm_offset_t)va, (unsigned)s->poolSize);
++		statNote(kStatDisplay, s->poolSize, started, 0);
+ 	}
+ 	s->vinceSynced = fence;
+ }
+-- 
+2.43.0
+
