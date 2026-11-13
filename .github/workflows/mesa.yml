@@ -1,0 +1,32 @@
+name: mesa
+# Mesa 25.0.7 (freedreno + OSMesa) for the iOS 16 userland and the gputest program, built with Xcode's clang.
+# Run by hand (Actions -> mesa -> Run workflow). The result is the artifact "mesa-ios".
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          brew install meson ninja bison flex pkg-config
+          xcrun --sdk iphoneos --show-sdk-path
+      - name: Build
+        run: bash userland/mesa/mk-mesa-ci.sh
+      - name: Logs of a failed build
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-logs
+          path: |
+            build-mesa/meson-setup.log
+            build-mesa/ninja.log
+            build-mesa/build-*/meson-logs/meson-log.txt
+      - name: Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-ios
+          path: build-mesa/out/
