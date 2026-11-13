@@ -1,0 +1,243 @@
+From 8d5438f7b44722cfa72d28f4f0cce06a022bb77b Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Fri, 13 Nov 2026 17:02:41 +0000
+Subject: [PATCH] 1021 vince: vineskipclean=1 skips the cache clean for
+ untouched surfaces; submits clean without the lock
+
+vineflushstats (1020) showed ~109 buffers and ~53 MiB cleaned per frame at a submit, ~9 ms of
+a ~43 ms frame, all under the driver's lock. Two changes:
+
+With vineskipclean=1 (off by default) a submit does not clean the cache for a buffer that is an
+IOSurface no program has locked for writing since the cache was last cleaned for it. A program must
+lock a surface before the processor touches its memory (IOSurfaceLock bounds CPU access to the raw
+data), so such a surface has no dirty line, and what the GPU wrote reaches the CPU through the clean
+on lock (vince_surface_sync) as before. A new SweetSurface::vinceCpu says "a program may have written
+it": set at creation and by a lock or unlock for writing, cleared when the cache is cleaned. Buffers
+that are not surfaces (the library writes them through plain mappings, freedreno's unsynchronized
+map is just fd_bo_map) and the clean after a fence in cpu_prep are cleaned as always. The stats line
+gets the skipped surfaces.
+
+A submit now collects the mappings under the lock, cleans the caches with the lock released (each
+mapping retained meanwhile), and takes the lock again for the submission, so another thread's submit
+no longer waits for the cleaning.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetSurface.cpp |   8 ++-
+ iokit/Kernel/arm/SweetSurface.h   |   3 +-
+ iokit/Kernel/arm/VinceGPU.cpp     | 103 ++++++++++++++++++++++++++----
+ 3 files changed, 99 insertions(+), 15 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 66b9622..7190db0 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1725,7 +1725,7 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+@@ -1735,6 +1735,9 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s->vincePool) {
+ 		/* a program is about to read or write the picture: the GPU may have drawn it, and its cache does not know */
+ 		vince_surface_sync(s);
++		if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++			s->vinceCpu = true;     /* it may write: the next submit has to clean the cache for it */
++		}
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+@@ -1749,6 +1752,9 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (s->vincePool && !((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++		s->vinceCpu = true;             /* what it wrote up to now may sit in the cache */
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 0637b09..6aef0f9 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -52,8 +52,9 @@ public:
+ 	uint64_t                  poolPhys;     /* ... its physical address (= the GPU's), */
+ 	uint32_t                  vinceDrawn;   /* ... and the last submission of VinceGPU that names it */
+ 	uint32_t      vinceSynced;      /* ... and the one whose picture the cache was last dropped for */
++	bool          vinceCpu;         /* ... and whether a program may have written it since VinceGPU last cleaned the cache for it */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; vincePool = false; poolPhys = 0; vinceDrawn = 0; vinceSynced = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; vincePool = false; poolPhys = 0; vinceDrawn = 0; vinceSynced = 0; vinceCpu = true; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index b1f0f27..369d6ca 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -145,7 +145,7 @@ static bool gFallbackDead = false;      /* RAM outside the pool has had no 1 MiB
+  * display is about to scan (vince_surface_sync), and the waits for the GPU's fence (gpuWait, which polls every
+  * millisecond). Counts only; nothing else changes.
+  */
+-enum { kStatCache, kStatDisplay, kStatWait, kStatKinds };
++enum { kStatCache, kStatDisplay, kStatWait, kStatSkip, kStatKinds };
+ static struct { uint64_t calls, bytes, ns, polls; } gStat[kStatKinds];
+ static uint64_t gStatNext, gStatPeriod;
+ 
+@@ -179,10 +179,11 @@ statNote(int kind, uint64_t bytes, uint64_t started, uint64_t polls)
+ 	} else if (now >= gStatNext) {
+ 		gStatNext = now + gStatPeriod;
+ 		IOLog("VinceGPU: 10 s: cache clean for submits/reads %llu x %llu MiB %llu ms; display clean %llu x %llu MiB %llu ms; "
+-		    "fence waits %llu x %llu ms (%llu polls)\n",
++		    "fence waits %llu x %llu ms (%llu polls); skipped (surface not written by the CPU) %llu x %llu MiB\n",
+ 		    gStat[kStatCache].calls, gStat[kStatCache].bytes >> 20, gStat[kStatCache].ns / NSEC_PER_MSEC,
+ 		    gStat[kStatDisplay].calls, gStat[kStatDisplay].bytes >> 20, gStat[kStatDisplay].ns / NSEC_PER_MSEC,
+-		    gStat[kStatWait].calls, gStat[kStatWait].ns / NSEC_PER_MSEC, gStat[kStatWait].polls);
++		    gStat[kStatWait].calls, gStat[kStatWait].ns / NSEC_PER_MSEC, gStat[kStatWait].polls,
++		    gStat[kStatSkip].calls, gStat[kStatSkip].bytes >> 20);
+ 		bzero(gStat, sizeof(gStat));
+ 	}
+ }
+@@ -204,22 +205,70 @@ cacheMode(void)
+ 	return mode == 1;
+ }
+ 
+-static void
+-cacheSync(struct gpu_buffer *b)
++/*
++ * vineskipclean=1: a submit does not clean the cache for a buffer that is a surface (IOSurface) which no program has
++ * locked for writing since the last time it was cleaned. A program must lock a surface before the processor touches
++ * its memory (IOSurfaceLock: "a bound on CPU access to the raw data"), so such a surface has no dirty line in the
++ * cache, and what the GPU wrote reaches the CPU through the clean on lock (vince_surface_sync). Buffers of the
++ * library that are not surfaces are cleaned as before: the library writes them through plain mappings without
++ * telling the kernel (freedreno's unsynchronized map is just fd_bo_map).
++ */
++static bool
++skipMode(void)
++{
++	static int mode = -1;
++	if (mode < 0) {
++		uint32_t v = 0;
++		mode = (PE_parse_boot_argn("vineskipclean", &v, sizeof(v)) && v) ? 1 : 0;
++	}
++	return mode == 1;
++}
++
++/*
++ * The cacheable kernel mapping to clean for a buffer (retained; the caller releases it), or NULL if there is
++ * nothing to clean. beforeSubmit: the buffer is about to be named in a submit, so a clean surface can be left alone.
++ * Under gGPULock.
++ */
++static IOMemoryMap *
++cacheMap(struct gpu_buffer *b, bool beforeSubmit)
+ {
+ 	if (!cacheMode() || !b->pooled || b->memory == NULL) {
+-		return;
++		return NULL;
++	}
++	if (beforeSubmit && b->surface != NULL && skipMode() && !b->surface->vinceCpu) {
++		statNote(kStatSkip, b->size, mach_absolute_time(), 0);
++		return NULL;
+ 	}
+ 	if (b->kmap == NULL) {
+ 		b->kmap = b->memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache);
+ 		if (b->kmap == NULL) {
+ 			IOLog("VinceGPU: no cacheable kernel mapping of a buffer of %llu bytes\n", b->size);
+-			return;
++			return NULL;
+ 		}
+ 	}
++	if (b->surface != NULL) {
++		b->surface->vinceCpu = false;
++	}
++	b->kmap->retain();
++	return b->kmap;
++}
++
++static void
++cacheClean(IOMemoryMap *map, uint64_t size)
++{
+ 	uint64_t started = mach_absolute_time();
+-	sweet_dcache_flush((vm_offset_t)b->kmap->getVirtualAddress(), (unsigned)b->size);
+-	statNote(kStatCache, b->size, started, 0);
++	sweet_dcache_flush((vm_offset_t)map->getVirtualAddress(), (unsigned)size);
++	statNote(kStatCache, size, started, 0);
++	map->release();
++}
++
++static void
++cacheSync(struct gpu_buffer *b)
++{
++	IOMemoryMap *map = cacheMap(b, false);
++	if (map != NULL) {
++		cacheClean(map, b->size);
++	}
+ }
+ 
+ /*
+@@ -1048,6 +1097,8 @@ VinceGPUUserClient::submit(struct msm_gem_submit *request)
+ 	uint64_t addresses[16];
+ 	uint32_t words[16];
+ 	uint32_t count = 0;
++	IOMemoryMap **maps = NULL;
++	uint64_t *sizes = NULL;
+ 	IOReturn ret = kIOReturnSuccess;
+ 
+ 	if (request->nr_bos == 0 || request->nr_cmds == 0 || request->nr_cmds > 16) {
+@@ -1079,10 +1130,30 @@ VinceGPUUserClient::submit(struct msm_gem_submit *request)
+ 		addresses[count] = b->address + cmds[i].submit_offset;
+ 		words[count++] = cmds[i].size / 4;
+ 	}
+-	for (uint32_t i = 0; i < request->nr_bos; i++) {
+-		struct gpu_buffer *b = buffer(bos[i].handle);
+-		if (b != NULL) {
+-			cacheSync(b);
++	/* the cache is cleaned without the lock, so that another thread's submit does not wait for it */
++	maps = (IOMemoryMap **)IOMallocZero(request->nr_bos * sizeof(*maps));
++	sizes = (uint64_t *)IOMallocZero(request->nr_bos * sizeof(*sizes));
++	if (maps != NULL && sizes != NULL) {
++		for (uint32_t i = 0; i < request->nr_bos; i++) {
++			struct gpu_buffer *b = buffer(bos[i].handle);
++			if (b != NULL) {
++				maps[i] = cacheMap(b, true);
++				sizes[i] = b->size;
++			}
++		}
++		IOLockUnlock(gGPULock);
++		for (uint32_t i = 0; i < request->nr_bos; i++) {
++			if (maps[i] != NULL) {
++				cacheClean(maps[i], sizes[i]);
++			}
++		}
++		IOLockLock(gGPULock);
++	} else {
++		for (uint32_t i = 0; i < request->nr_bos; i++) {
++			struct gpu_buffer *b = buffer(bos[i].handle);
++			if (b != NULL) {
++				cacheSync(b);
++			}
+ 		}
+ 	}
+ 
+@@ -1103,6 +1174,12 @@ VinceGPUUserClient::submit(struct msm_gem_submit *request)
+ 	}
+ 
+ out:
++	if (maps != NULL) {
++		IOFree(maps, request->nr_bos * sizeof(*maps));
++	}
++	if (sizes != NULL) {
++		IOFree(sizes, request->nr_bos * sizeof(*sizes));
++	}
+ 	if (bos != NULL) {
+ 		IOFree(bos, request->nr_bos * sizeof(*bos));
+ 	}
+-- 
+2.43.0
+
