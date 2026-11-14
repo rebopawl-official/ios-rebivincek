@@ -1,0 +1,454 @@
+From 5b22ca5d2e7be880fad4a3155377538ec16f5183 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Sat, 14 Nov 2026 06:44:26 +0000
+Subject: [PATCH] 1022 vince: vinceprof=1 samples where backboardd and
+ SpringBoard spend their CPU time
+
+The window server's frame takes ~43 ms, of which ~9 ms is the cache clean and ~8 ms the GPU; the
+rest (~25 ms) is processor time in backboardd (Mesa, CoreAnimation), and the one-off SMP sample
+(a stack per thread every 30 s) cannot say where. This is a sampling profiler. With vinceprof=1
+(or vinceprof=name[,name], at most two processes; vinceprof_first seconds, 60, and vinceprof_every
+seconds, 20, set the first window and the window length) a kernel thread sends every other
+running CPU an IPI (cpu_xcall) 200 times a second. The call runs in the IPI's interrupt, where
+cpu_int_state is what the CPU was doing: if it was a thread of a watched task, its user pc and lr
+(or, in the kernel, its pc) go into a small per-CPU table; idle and other tasks are counted. Nothing
+is read from user memory in the interrupt, so there is no stack walk, only pc and the link register.
+Every window the thread prints "VPROF" lines: the shares of the CPU time (idle, other, each task in
+user mode and in the kernel) and the 16 most frequent addresses of each kind as "file+offset" (the
+file and the offset in it from the region's vnode, for nm or the cache's symbols; shared cache code
+shows as an anonymous region, with the raw address to use with the slide of the SMP header) and,
+for the kernel, raw and unslid. Off by default; costs about 1400 IPIs a second while on.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ bsd/dev/sweet_sample.c | 124 ++++++++++++++++++++
+ osfmk/kern/exception.c | 258 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 382 insertions(+)
+
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index 4f8d57d..0aa5c0e 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -21,6 +21,10 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <pthread/workqueue_internal.h>
++#include <sys/bsdtask_info.h>
++#include <sys/vnode.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -120,6 +124,123 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * vinceprof (boot-arg; 1 = "backboardd,SpringBoard", or up to two process names, comma separated; 0 or absent = off):
++ * a sampling profiler. The kernel thread below sends the other CPUs an IPI 200 times a second; what each CPU was
++ * doing is counted in osfmk/kern/exception.c (vprof_cb), and every window (vinceprof_every seconds, 20 by default,
++ * the first starts vinceprof_first seconds after boot, 60 by default) a few lines "VPROF ..." say how the CPU time
++ * was shared and which addresses were hottest: user pc and lr as "file+offset", kernel pc as raw and unslid.
++ */
++extern void vince_prof_task(int slot, task_t task);
++extern void vince_prof_tick(void);
++extern void vince_prof_report(const char *const *names, int nt, uint32_t secs);
++
++static char vprof_names[2][32];
++
++/* "libOSMesa.8.dylib+0x1234": the file a user address belongs to and the offset in the file (for nm / the cache's symbols) */
++void
++sweet_prof_where(task_t task, uint64_t va, char *out, size_t len)
++{
++	struct proc_regioninfo_internal info;
++	uintptr_t vp = 0;
++	uint32_t vid = 0;
++
++	bzero(&info, sizeof(info));
++	out[0] = 0;
++	if (task == TASK_NULL || fill_procregioninfo(task, va, &info, &vp, &vid) == 0 ||
++	    va < info.pri_address || va >= info.pri_address + info.pri_size) {
++		snprintf(out, len, "(not mapped)");
++		return;
++	}
++	if (vp != 0 && vnode_getwithvid((vnode_t)vp, vid) == 0) {
++		char path[256];
++		int plen = (int)sizeof(path);
++
++		if (vn_getpath((vnode_t)vp, path, &plen) == 0) {
++			const char *base = strrchr(path, '/');
++			snprintf(out, len, "%s+0x%llx", base != NULL ? base + 1 : path, info.pri_offset + (va - info.pri_address));
++		} else {
++			snprintf(out, len, "(file, no path)+0x%llx", info.pri_offset + (va - info.pri_address));
++		}
++		vnode_put((vnode_t)vp);
++		return;
++	}
++	snprintf(out, len, "(anonymous 0x%llx-0x%llx)+0x%llx", info.pri_address, info.pri_address + info.pri_size,
++	    va - info.pri_address);
++}
++
++static int
++vprof_match(proc_t p, __unused void *arg)
++{
++	char name[32];
++
++	proc_name(proc_pid(p), name, sizeof(name));
++	for (int i = 0; i < 2; i++) {
++		if (vprof_names[i][0] != 0 && strcmp(name, vprof_names[i]) == 0) {
++			task_t task = proc_task(p);
++			if (task != TASK_NULL) {
++				vince_prof_task(i, task);
++			}
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static void
++vprof_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	char value[80];
++	static int chan;
++	uint32_t first = 60, every = 20;
++	const char *names[2] = { vprof_names[0], vprof_names[1] };
++	int nt = 0;
++
++	if (!PE_parse_boot_argn("vinceprof", value, sizeof(value)) || value[0] == '0' || value[0] == 0) {
++		return;
++	}
++	if (value[0] == '1' && value[1] == 0) {
++		strlcpy(value, "backboardd,SpringBoard", sizeof(value));
++	}
++	for (char *t = value; *t != 0 && nt < 2;) {
++		char *end = strchr(t, ',');
++		size_t n = end != NULL ? (size_t)(end - t) : strlen(t);
++
++		if (n > 0 && n < sizeof(vprof_names[0])) {
++			memcpy(vprof_names[nt], t, n);
++			vprof_names[nt][n] = 0;
++			nt++;
++		}
++		if (end == NULL) {
++			break;
++		}
++		t = end + 1;
++	}
++	(void)PE_parse_boot_argn("vinceprof_first", &first, sizeof(first));
++	(void)PE_parse_boot_argn("vinceprof_every", &every, sizeof(every));
++	if (first > 3600) {
++		first = 60;
++	}
++	if (every == 0 || every > 600) {
++		every = 20;
++	}
++	printf("VPROF: watching %s%s%s, first window after %u s, then every %u s\n", vprof_names[0],
++	    nt > 1 ? " and " : "", nt > 1 ? vprof_names[1] : "", first, every);
++	(void)tsleep(&chan, PZERO, "vprof", (int)first * hz);
++	for (int w = 0; w < 60; w++) {
++		/* the processes may have been restarted: find them again each window */
++		vince_prof_task(0, TASK_NULL);
++		vince_prof_task(1, TASK_NULL);
++		proc_iterate(PROC_ALLPROCLIST, vprof_match, NULL, NULL, NULL);
++		for (uint32_t i = 0; i < every * 200; i++) {
++			vince_prof_tick();
++			delay_for_interval(5, NSEC_PER_MSEC);
++		}
++		vince_prof_report(names, nt, every);
++	}
++	vince_prof_task(0, TASK_NULL);
++	vince_prof_task(1, TASK_NULL);
++}
++
+ void
+ sweet_sample_start(void)
+ {
+@@ -127,4 +248,7 @@ sweet_sample_start(void)
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start_priority(vprof_thread, NULL, 90, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 3068b22..e6fd809 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -825,6 +825,10 @@ exception_triage(
+ #include <arm/thread.h>
+ #include <ipc/ipc_port.h>
+ #include <ipc/ipc_kmsg.h>
++#include <arm/cpu_data.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_number.h>
++#include <arm/machine_routines.h>
+ 
+ /*
+  * SWEET crash report on the console. The phone has no way to get crash
+@@ -1104,6 +1108,260 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	sweet_sample_ipc(name, pid, task);
+ }
+ 
++/*
++ * vinceprof: where does a process spend its time? A kernel thread (bsd/dev/sweet_sample.c) sends every CPU that is
++ * running an inter-processor call 200 times a second (cpu_xcall). The call runs in the interrupt that the IPI is, so
++ * cpu_int_state is the state of what the CPU was doing: if that was a thread of one of the watched tasks, its user pc
++ * and lr (or, in the kernel, its pc) are counted in a small per-CPU table. Nothing is read from user memory here
++ * (an interrupt must not fault), so no stack walk, only pc and the link register (the caller of a leaf function).
++ * Every window the thread prints the shares of time and the most frequent addresses, as image and file offset
++ * (vince_prof_report).
++ */
++#define VPROF_CPUS      8
++#define VPROF_TARGETS   2
++#define VPROF_SLOTS     2048            /* a power of two */
++#define VPROF_TOP       16
++
++struct vprof_ent {
++	uint64_t key;                   /* (pc & 0xffffffffffff) | kind << 48 | target << 50 | 1 << 52; 0 = empty */
++	uint32_t n;
++};
++
++static struct vprof_cpu {
++	uint64_t idle, other, nostate, dropped;
++	uint64_t user[VPROF_TARGETS], kern[VPROF_TARGETS];
++	struct vprof_ent tab[VPROF_SLOTS];
++} vprof_cpu[VPROF_CPUS];
++
++static task_t vprof_task[VPROF_TARGETS];
++
++enum { kVProfUserPc = 0, kVProfUserLr = 1, kVProfKernPc = 2 };
++
++#define VPROF_KEY(t, kind, pc)  (((uint64_t)(pc) & 0xffffffffffffULL) | ((uint64_t)(kind) << 48) | ((uint64_t)(t) << 50) | (1ULL << 52))
++#define VPROF_KIND(key)         ((unsigned)(((key) >> 48) & 3))
++#define VPROF_TARGET(key)       ((unsigned)(((key) >> 50) & 3))
++
++extern void sweet_prof_where(task_t task, uint64_t va, char *out, size_t len);      /* bsd/dev/sweet_sample.c */
++
++static struct vprof_ent *
++vprof_find(struct vprof_cpu *c, uint64_t key, bool create)
++{
++	uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 53);
++
++	for (uint32_t i = 0; i < 16; i++) {
++		struct vprof_ent *e = &c->tab[(h + i) & (VPROF_SLOTS - 1)];
++		if (e->key == key) {
++			return e;
++		}
++		if (e->key == 0) {
++			if (create) {
++				e->key = key;
++				e->n = 0;
++				return e;
++			}
++			return NULL;
++		}
++	}
++	return NULL;
++}
++
++static void
++vprof_add(struct vprof_cpu *c, uint64_t key)
++{
++	struct vprof_ent *e = vprof_find(c, key, true);
++
++	if (e != NULL) {
++		e->n++;
++	} else {
++		c->dropped++;
++	}
++}
++
++/* runs on the CPU that is sampled, in the interrupt of the IPI */
++static void
++vprof_cb(__unused void *param)
++{
++	int cpu = cpu_number();
++	thread_t th = current_thread();
++	task_t task = current_task();
++	arm_saved_state_t *ss;
++	struct vprof_cpu *c;
++	int t = -1;
++
++	if (cpu < 0 || cpu >= VPROF_CPUS) {
++		return;
++	}
++	c = &vprof_cpu[cpu];
++	if (th->state & TH_IDLE) {
++		c->idle++;
++		return;
++	}
++	for (int i = 0; i < VPROF_TARGETS; i++) {
++		if (vprof_task[i] != TASK_NULL && task == vprof_task[i]) {
++			t = i;
++		}
++	}
++	if (t < 0) {
++		c->other++;
++		return;
++	}
++	ss = (arm_saved_state_t *)getCpuDatap()->cpu_int_state;
++	if (ss == NULL || !is_saved_state64(ss)) {
++		c->nostate++;
++		return;
++	}
++	if (PSR64_IS_USER(get_saved_state_cpsr(ss))) {
++		c->user[t]++;
++		vprof_add(c, VPROF_KEY(t, kVProfUserPc, get_saved_state_pc(ss)));
++		vprof_add(c, VPROF_KEY(t, kVProfUserLr, get_saved_state_lr(ss)));
++	} else {
++		c->kern[t]++;
++		vprof_add(c, VPROF_KEY(t, kVProfKernPc, get_saved_state_pc(ss)));
++	}
++}
++
++/* a watched task (a reference is held, released by the next call for the slot); TASK_NULL drops the old one */
++void
++vince_prof_task(int slot, task_t task)
++{
++	task_t old;
++
++	if (slot < 0 || slot >= VPROF_TARGETS) {
++		return;
++	}
++	if (task != TASK_NULL) {
++		task_reference(task);
++	}
++	old = vprof_task[slot];
++	vprof_task[slot] = task;
++	if (old != TASK_NULL) {
++		task_deallocate(old);
++	}
++}
++
++/* one round of samples: every other CPU that is running gets an IPI */
++void
++vince_prof_tick(void)
++{
++	static int dummy;
++	int self = cpu_number();
++	int max = ml_get_max_cpu_number();
++
++	for (int cpu = 0; cpu <= max && cpu < VPROF_CPUS; cpu++) {
++		processor_t p = processor_array[cpu];
++
++		if (cpu == self || p == NULL || p->state < PROCESSOR_IDLE) {
++			continue;
++		}
++		(void)cpu_xcall(cpu, vprof_cb, &dummy);
++	}
++}
++
++static uint64_t
++vprof_total(uint64_t key)
++{
++	uint64_t n = 0;
++
++	for (int cpu = 0; cpu < VPROF_CPUS; cpu++) {
++		struct vprof_ent *e = vprof_find(&vprof_cpu[cpu], key, false);
++		if (e != NULL) {
++			n += e->n;
++		}
++	}
++	return n;
++}
++
++static void
++vprof_clear(uint64_t key)
++{
++	for (int cpu = 0; cpu < VPROF_CPUS; cpu++) {
++		struct vprof_ent *e = vprof_find(&vprof_cpu[cpu], key, false);
++		if (e != NULL) {
++			e->n = 0;
++		}
++	}
++}
++
++void
++vince_prof_report(const char *const *names, int nt, uint32_t secs)
++{
++	static const char *const kinds[] = { "user pc", "user lr", "kernel pc" };
++	uint64_t idle = 0, other = 0, nostate = 0, dropped = 0, total;
++	uint64_t user[VPROF_TARGETS] = { 0 }, kern[VPROF_TARGETS] = { 0 };
++
++	for (int cpu = 0; cpu < VPROF_CPUS; cpu++) {
++		struct vprof_cpu *c = &vprof_cpu[cpu];
++		idle += c->idle;
++		other += c->other;
++		nostate += c->nostate;
++		dropped += c->dropped;
++		for (int t = 0; t < VPROF_TARGETS; t++) {
++			user[t] += c->user[t];
++			kern[t] += c->kern[t];
++		}
++	}
++	total = idle + other + nostate;
++	for (int t = 0; t < VPROF_TARGETS; t++) {
++		total += user[t] + kern[t];
++	}
++	if (total == 0) {
++		total = 1;
++	}
++	printf("VPROF window %u s, %llu samples: idle %llu.%llu%%, other tasks %llu.%llu%%, no state %llu, table full %llu\n",
++	    secs, total, idle * 100 / total, (idle * 1000 / total) % 10, other * 100 / total, (other * 1000 / total) % 10,
++	    nostate, dropped);
++	for (int t = 0; t < nt && t < VPROF_TARGETS; t++) {
++		printf("VPROF %s: user %llu.%llu%%, kernel %llu.%llu%% of all CPU time (%llu + %llu samples)\n", names[t],
++		    user[t] * 100 / total, (user[t] * 1000 / total) % 10, kern[t] * 100 / total, (kern[t] * 1000 / total) % 10,
++		    user[t], kern[t]);
++	}
++	for (int t = 0; t < nt && t < VPROF_TARGETS; t++) {
++		for (int kind = 0; kind < 3; kind++) {
++			uint64_t base = kind == kVProfKernPc ? kern[t] : user[t];
++
++			if (base == 0) {
++				continue;
++			}
++			for (int k = 0; k < VPROF_TOP; k++) {
++				uint64_t bestkey = 0, best = 0, pc;
++				char where[160];
++
++				for (int cpu = 0; cpu < VPROF_CPUS; cpu++) {
++					for (uint32_t i = 0; i < VPROF_SLOTS; i++) {
++						struct vprof_ent *e = &vprof_cpu[cpu].tab[i];
++						uint64_t tot;
++
++						if (e->key == 0 || e->n == 0 || VPROF_TARGET(e->key) != (unsigned)t || VPROF_KIND(e->key) != (unsigned)kind) {
++							continue;
++						}
++						tot = vprof_total(e->key);
++						if (tot > best) {
++							best = tot;
++							bestkey = e->key;
++						}
++					}
++				}
++				if (best == 0) {
++					break;
++				}
++				pc = bestkey & 0xffffffffffffULL;
++				if (kind == kVProfKernPc) {
++					pc |= 0xffff000000000000ULL;
++					printf("VPROF %s %s 0x%llx (unslid 0x%llx) %llu.%llu%%\n", names[t], kinds[kind], pc,
++					    (uint64_t)VM_KERNEL_UNSLIDE(pc), best * 100 / base, (best * 1000 / base) % 10);
++				} else {
++					sweet_prof_where(vprof_task[t], pc, where, sizeof(where));
++					printf("VPROF %s %s 0x%llx %s %llu.%llu%%\n", names[t], kinds[kind], pc, where,
++					    best * 100 / base, (best * 1000 / base) % 10);
++				}
++				vprof_clear(bestkey);
++			}
++		}
++	}
++	bzero(vprof_cpu, sizeof(vprof_cpu));
++}
++
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t
+-- 
+2.43.0
+
