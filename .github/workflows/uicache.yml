@@ -1,0 +1,27 @@
+name: uicache
+# Builds vince-uicache (registers /Applications with LaunchServices) for the iOS 16 userland.
+# Run by hand (Actions -> uicache -> Run workflow). The result is the artifact "vince-uicache".
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          mkdir out
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O1 -Wall \
+            -framework Foundation -o out/vince-uicache userland/uicache/vince-uicache.m
+          codesign -f -s - --entitlements userland/uicache/entitlements.plist out/vince-uicache
+          codesign -d --entitlements - out/vince-uicache || true
+          cp userland/uicache/install.py out/
+          ls -l out
+      - name: Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: vince-uicache
+          path: out/
