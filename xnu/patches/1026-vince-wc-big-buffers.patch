@@ -1,0 +1,98 @@
+From 60ca9973b3aa2c2c074ae5f2afa7a3177d12d083 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 18 Nov 2026 19:46:51 +0000
+Subject: [PATCH] 1026 vince: vincewc=N keeps pool buffers of N KiB and more
+ write-combined, so submits do not clean them
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/VinceGPU.cpp | 42 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index 7129332..ef0bac0 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -286,6 +286,33 @@ skipMode(void)
+ 	return mode == 1;
+ }
+ 
++/*
++ * vincewc=N: a pool buffer of N KiB or more that is not a surface stays write-combined (as the pool is mapped in the
++ * kernel), instead of cached like the rest (vincecache=1). The processor's stores to it go to RAM at once, so a
++ * submit has nothing to clean for it and its cache has nothing of it to go stale. The statistics (vineflushstats=1)
++ * showed that the big buffers (1 MiB and more, ~4 MiB each, two or three to a submit) take most of the time the
++ * submits spend cleaning the cache, and that no program asks to read a buffer (cpu_prep for reading is never called).
++ * A program that did read such a buffer would read write-combined memory (~70 MB/s), so this is for finding out.
++ * vincewc=0 or none: as before.
++ */
++static uint64_t
++wcMinBytes(void)
++{
++	static int64_t min = -1;
++	if (min < 0) {
++		uint32_t v = 0;
++		min = PE_parse_boot_argn("vincewc", &v, sizeof(v)) ? (int64_t)v * 1024 : 0;
++	}
++	return (uint64_t)min;
++}
++
++static bool
++wcBuffer(struct gpu_buffer *b)
++{
++	uint64_t min = wcMinBytes();
++	return min != 0 && b->pooled && b->surface == NULL && b->size >= min;
++}
++
+ /*
+  * The cacheable kernel mapping to clean for a buffer (retained; the caller releases it), or NULL if there is
+  * nothing to clean. beforeSubmit: the buffer is about to be named in a submit, so a clean surface can be left alone.
+@@ -294,7 +321,7 @@ skipMode(void)
+ static IOMemoryMap *
+ cacheMap(struct gpu_buffer *b, bool beforeSubmit)
+ {
+-	if (!cacheMode() || !b->pooled || b->memory == NULL) {
++	if (!cacheMode() || !b->pooled || b->memory == NULL || wcBuffer(b)) {
+ 		return NULL;
+ 	}
+ 	if (beforeSubmit && b->surface != NULL && skipMode() && !b->surface->vinceCpu) {
+@@ -989,6 +1016,7 @@ VinceGPUUserClient::gemNew(struct msm_gem_new *request)
+ 	struct gpu_buffer *b = NULL;
+ 	IOMemoryDescriptor *memory = NULL;
+ 	uint64_t pooled = 0;
++	bool wc = false;
+ 
+ 	if (size == 0 || size > GPU_BUFFER_MAX || fBuffers == NULL) {
+ 		return kIOReturnBadArgument;
+@@ -1104,8 +1132,18 @@ VinceGPUUserClient::gemNew(struct msm_gem_new *request)
+ 	b->size = size;
+ 	b->flags = request->flags;
+ 	b->seq = ++gSeq;
++	wc = wcBuffer(b);
+ 	IOLockUnlock(gGPULock);
+ 
++	if (wc) {
++		/* the piece may have been a cached buffer of an earlier client: nothing of it may be left in the cache to be
++		 * written back over what the write-combined stores put there */
++		IOMemoryMap *map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache);
++		if (map != NULL) {
++			sweet_dcache_flush((vm_offset_t)map->getVirtualAddress(), (unsigned)size);
++			map->release();
++		}
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -1329,7 +1367,7 @@ VinceGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMe
+ 	if (b != NULL && b->memory != NULL) {
+ 		b->memory->retain();
+ 		*memory = b->memory;
+-		*options = (b->pooled || b->surface != NULL) ? (cacheMode() ? kIOMapCopybackCache : kIOMapWriteCombineCache) : 0;
++		*options = (b->pooled || b->surface != NULL) ? ((cacheMode() && !wcBuffer(b)) ? kIOMapCopybackCache : kIOMapWriteCombineCache) : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gGPULock);
+-- 
+2.43.0
+
