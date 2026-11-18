@@ -1,0 +1,225 @@
+From b73fd0a468747bd5757d6fbd557240783a124653 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 18 Nov 2026 18:35:32 +0000
+Subject: [PATCH] 1025 vince: vineflushstats=1 also counts what the submit
+ cleans are made of and how surfaces are locked
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetSurface.cpp |  4 ++
+ iokit/Kernel/arm/SweetSurface.h   |  2 +
+ iokit/Kernel/arm/VinceGPU.cpp     | 89 ++++++++++++++++++++++++++++---
+ 3 files changed, 89 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7190db0..fc0cd16 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1735,6 +1735,7 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+ 	if (s->vincePool) {
+ 		/* a program is about to read or write the picture: the GPU may have drawn it, and its cache does not know */
+ 		vince_surface_sync(s);
++		vince_surface_lock_note(false, !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 		if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
+ 			s->vinceCpu = true;     /* it may write: the next submit has to clean the cache for it */
+ 		}
+@@ -1752,6 +1753,9 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (s->vincePool) {
++		vince_surface_lock_note(true, !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	}
+ 	if (s->vincePool && !((uintptr_t)options & kIOSurfaceLockReadOnly)) {
+ 		s->vinceCpu = true;             /* what it wrote up to now may sit in the cache */
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 53cefcd..0990ae6 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -94,6 +94,8 @@ extern "C" void vince_pool_free(uint64_t pa, uint64_t size);
+ extern "C" void vince_surface_sync(SweetSurface *surface);
+ /* The display (not a processor) is about to scan the surface: wait for the GPU and clean only what a program wrote (vincescan=1). */
+ extern "C" void vince_surface_scan(SweetSurface *surface);
++/* A program locked or unlocked a surface of the pool (counts for vineflushstats=1). */
++extern "C" void vince_surface_lock_note(bool unlock, bool write);
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index 136acd9..7129332 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -149,6 +149,53 @@ enum { kStatCache, kStatDisplay, kStatWait, kStatSkip, kStatKinds };
+ static struct { uint64_t calls, bytes, ns, polls; } gStat[kStatKinds];
+ static uint64_t gStatNext, gStatPeriod;
+ 
++/*
++ * The detail behind vineflushstats=1 (a second line every 10 s): what the submit cleans are made of (a surface or
++ * another buffer, by size), what a program's cpu_prep read cleans, how many submits and buffers there were, how much
++ * of a submit's cleaning is for the buffers its command streams live in (and how much of them a command stream
++ * really uses), how often programs lock and unlock surfaces for writing, and how many of the display's looks at a
++ * surface cleaned it. Counts only; nothing else changes.
++ */
++enum { kDetSubSurfS, kDetSubSurfM, kDetSubSurfL, kDetSubOtherS, kDetSubOtherM, kDetSubOtherL, kDetRead, kDetKinds };
++static struct { uint64_t calls, bytes, ns; } gDet[kDetKinds];
++enum { kCntSubmits, kCntBos, kCntCmdBuf, kCntCmdUsed, kCntLockW, kCntLockR, kCntUnlockW, kCntUnlockR,
++       kCntScans, kCntScanClean, kCntSyncClean, kCntKinds };
++static uint64_t gCnt[kCntKinds];
++#define kDetSurfaceBit (1ull << 63)     /* in a size: the buffer is a surface */
++
++static bool statsOn(void);
++
++static void
++cntAdd(int kind, uint64_t n)
++{
++	if (statsOn()) {
++		__atomic_fetch_add(&gCnt[kind], n, __ATOMIC_RELAXED);
++	}
++}
++
++static void
++detNote(int kind, uint64_t bytes, uint64_t started)
++{
++	uint64_t ns;
++
++	if (!statsOn()) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
++	__atomic_fetch_add(&gDet[kind].calls, 1, __ATOMIC_RELAXED);
++	__atomic_fetch_add(&gDet[kind].bytes, bytes, __ATOMIC_RELAXED);
++	__atomic_fetch_add(&gDet[kind].ns, ns, __ATOMIC_RELAXED);
++}
++
++/* the kind of a submit clean: a surface or not, below 64 KiB, below 1 MiB, or more */
++static int
++detSubmitKind(uint64_t sizeAndSurface)
++{
++	uint64_t size = sizeAndSurface & ~kDetSurfaceBit;
++	int k = size < (64u << 10) ? 0 : (size < (1u << 20) ? 1 : 2);
++	return (sizeAndSurface & kDetSurfaceBit) ? kDetSubSurfS + k : kDetSubOtherS + k;
++}
++
+ static bool
+ statsOn(void)
+ {
+@@ -185,6 +232,21 @@ statNote(int kind, uint64_t bytes, uint64_t started, uint64_t polls)
+ 		    gStat[kStatWait].calls, gStat[kStatWait].ns / NSEC_PER_MSEC, gStat[kStatWait].polls,
+ 		    gStat[kStatSkip].calls, gStat[kStatSkip].bytes >> 20);
+ 		bzero(gStat, sizeof(gStat));
++		IOLog("VinceGPU: 10 s detail: submit clean surface <64K %llu x %llu MiB %llu ms, <1M %llu x %llu MiB %llu ms, >=1M %llu x %llu MiB %llu ms; "
++		    "other <64K %llu x %llu MiB %llu ms, <1M %llu x %llu MiB %llu ms, >=1M %llu x %llu MiB %llu ms; "
++		    "cpu_prep read clean %llu x %llu MiB %llu ms\n",
++		    gDet[0].calls, gDet[0].bytes >> 20, gDet[0].ns / NSEC_PER_MSEC, gDet[1].calls, gDet[1].bytes >> 20, gDet[1].ns / NSEC_PER_MSEC,
++		    gDet[2].calls, gDet[2].bytes >> 20, gDet[2].ns / NSEC_PER_MSEC, gDet[3].calls, gDet[3].bytes >> 20, gDet[3].ns / NSEC_PER_MSEC,
++		    gDet[4].calls, gDet[4].bytes >> 20, gDet[4].ns / NSEC_PER_MSEC, gDet[5].calls, gDet[5].bytes >> 20, gDet[5].ns / NSEC_PER_MSEC,
++		    gDet[6].calls, gDet[6].bytes >> 20, gDet[6].ns / NSEC_PER_MSEC);
++		IOLog("VinceGPU: 10 s counts: submits %llu with %llu buffers; command stream buffers %llu KiB, used by the commands %llu KiB; "
++		    "surface locks for write %llu / read %llu, unlocks for write %llu / read %llu; "
++		    "display looks %llu, of them cleaned %llu; cleaned for a program (lock, copy) %llu\n",
++		    gCnt[kCntSubmits], gCnt[kCntBos], gCnt[kCntCmdBuf] >> 10, gCnt[kCntCmdUsed] >> 10,
++		    gCnt[kCntLockW], gCnt[kCntLockR], gCnt[kCntUnlockW], gCnt[kCntUnlockR],
++		    gCnt[kCntScans], gCnt[kCntScanClean], gCnt[kCntSyncClean]);
++		bzero(gDet, sizeof(gDet));
++		bzero(gCnt, sizeof(gCnt));
+ 	}
+ }
+ 
+@@ -254,11 +316,12 @@ cacheMap(struct gpu_buffer *b, bool beforeSubmit)
+ }
+ 
+ static void
+-cacheClean(IOMemoryMap *map, uint64_t size)
++cacheClean(IOMemoryMap *map, uint64_t size, int detail)
+ {
+ 	uint64_t started = mach_absolute_time();
+-	sweet_dcache_flush((vm_offset_t)map->getVirtualAddress(), (unsigned)size);
+-	statNote(kStatCache, size, started, 0);
++	sweet_dcache_flush((vm_offset_t)map->getVirtualAddress(), (unsigned)(size & ~kDetSurfaceBit));
++	statNote(kStatCache, size & ~kDetSurfaceBit, started, 0);
++	detNote(detail, size & ~kDetSurfaceBit, started);
+ 	map->release();
+ }
+ 
+@@ -267,7 +330,7 @@ cacheSync(struct gpu_buffer *b)
+ {
+ 	IOMemoryMap *map = cacheMap(b, false);
+ 	if (map != NULL) {
+-		cacheClean(map, b->size);
++		cacheClean(map, b->size, kDetRead);
+ 	}
+ }
+ 
+@@ -578,6 +641,7 @@ vince_surface_sync(SweetSurface *s)
+ 		uint64_t started = mach_absolute_time();
+ 		sweet_dcache_flush((vm_offset_t)va, (unsigned)s->poolSize);
+ 		statNote(kStatDisplay, s->poolSize, started, 0);
++		cntAdd(kCntSyncClean, 1);
+ 	}
+ 	s->vinceSynced = fence;
+ }
+@@ -602,6 +666,7 @@ vince_surface_scan(SweetSurface *s)
+ 		uint32_t v = 0;
+ 		mode = (PE_parse_boot_argn("vincescan", &v, sizeof(v)) && v) ? 1 : 0;
+ 	}
++	cntAdd(kCntScans, 1);
+ 	if (mode != 1) {
+ 		vince_surface_sync(s);
+ 		return;
+@@ -627,6 +692,7 @@ vince_surface_scan(SweetSurface *s)
+ 		uint64_t started = mach_absolute_time();
+ 		sweet_dcache_flush((vm_offset_t)va, (unsigned)s->poolSize);
+ 		statNote(kStatDisplay, s->poolSize, started, 0);
++		cntAdd(kCntScanClean, 1);
+ 		s->vinceCpu = false;
+ 		if (fence != 0) {
+ 			s->vinceSynced = fence;         /* the cache holds nothing of this picture any more */
+@@ -634,6 +700,13 @@ vince_surface_scan(SweetSurface *s)
+ 	}
+ }
+ 
++/* A program locked or unlocked a surface of the pool (IOSurfaceLock/Unlock); counts for vineflushstats=1. */
++void
++vince_surface_lock_note(bool unlock, bool write)
++{
++	cntAdd(unlock ? (write ? kCntUnlockW : kCntUnlockR) : (write ? kCntLockW : kCntLockR), 1);
++}
++
+ void
+ VinceGPUStop(void)
+ {
+@@ -1179,9 +1252,13 @@ VinceGPUUserClient::submit(struct msm_gem_submit *request)
+ 			ret = kIOReturnBadArgument;
+ 			goto out;
+ 		}
++		cntAdd(kCntCmdBuf, b->size);
++		cntAdd(kCntCmdUsed, cmds[i].size);
+ 		addresses[count] = b->address + cmds[i].submit_offset;
+ 		words[count++] = cmds[i].size / 4;
+ 	}
++	cntAdd(kCntSubmits, 1);
++	cntAdd(kCntBos, request->nr_bos);
+ 	/* the cache is cleaned without the lock, so that another thread's submit does not wait for it */
+ 	maps = (IOMemoryMap **)IOMallocZero(request->nr_bos * sizeof(*maps));
+ 	sizes = (uint64_t *)IOMallocZero(request->nr_bos * sizeof(*sizes));
+@@ -1190,13 +1267,13 @@ VinceGPUUserClient::submit(struct msm_gem_submit *request)
+ 			struct gpu_buffer *b = buffer(bos[i].handle);
+ 			if (b != NULL) {
+ 				maps[i] = cacheMap(b, true);
+-				sizes[i] = b->size;
++				sizes[i] = b->size | (b->surface != NULL ? kDetSurfaceBit : 0);
+ 			}
+ 		}
+ 		IOLockUnlock(gGPULock);
+ 		for (uint32_t i = 0; i < request->nr_bos; i++) {
+ 			if (maps[i] != NULL) {
+-				cacheClean(maps[i], sizes[i]);
++				cacheClean(maps[i], sizes[i], detSubmitKind(sizes[i]));
+ 			}
+ 		}
+ 		IOLockLock(gGPULock);
+-- 
+2.43.0
+
