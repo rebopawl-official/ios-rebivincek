@@ -1,0 +1,31 @@
+From 15bec73f7e3d43b84e9ba218875c9ec230db3e29 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 18 Nov 2026 20:32:16 +0000
+Subject: [PATCH] 1027 vince: vincewc=N waits for the stores to write-combined
+ buffers before a submit
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/VinceGPU.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index ef0bac0..7e82945 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -1324,6 +1324,11 @@ VinceGPUUserClient::submit(struct msm_gem_submit *request)
+ 		}
+ 	}
+ 
++	if (wcMinBytes() != 0) {
++		/* the stores a program made to write-combined buffers (vincewc) have to be in RAM before the GPU is told to run:
++		 * a clean of the cache ended with this barrier, a buffer that is not cleaned has not had one */
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
+ 	request->fence = vince_gpu_submit(addresses, words, count);
+ 	if (request->fence != 0) {
+ 		/* the display waits for the GPU to be done with a surface before it reads it (vince_surface_sync) */
+-- 
+2.43.0
+
