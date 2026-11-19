@@ -1,0 +1,91 @@
+From 8c4c936b5af53c89a3e44ea191c98271c8b7ff65 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 19 Nov 2026 11:28:17 +0000
+Subject: [PATCH] 1029 vince: vincelockfast=1 makes IOSurfaceLock with
+ kIOSurfaceLockAvoidSync skip the GPU wait and the cache clean
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 11 ++++++++---
+ iokit/Kernel/arm/SweetSurface.h   |  2 ++
+ iokit/Kernel/arm/VinceGPU.cpp     | 19 +++++++++++++++++++
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index fc0cd16..d06c318 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1733,10 +1733,14 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+ 		return kIOReturnNotFound;
+ 	}
+ 	if (s->vincePool) {
++		bool avoid = ((uintptr_t)options & 2) != 0 && vince_lock_fast();     /* kIOSurfaceLockAvoidSync */
++
+ 		/* a program is about to read or write the picture: the GPU may have drawn it, and its cache does not know */
+-		vince_surface_sync(s);
++		if (!avoid) {
++			vince_surface_sync(s);
++		}
+ 		vince_surface_lock_note(false, !((uintptr_t)options & kIOSurfaceLockReadOnly));
+-		if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++		if (!avoid && !((uintptr_t)options & kIOSurfaceLockReadOnly)) {
+ 			s->vinceCpu = true;     /* it may write: the next submit has to clean the cache for it */
+ 		}
+ 	}
+@@ -1756,7 +1760,8 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s->vincePool) {
+ 		vince_surface_lock_note(true, !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	}
+-	if (s->vincePool && !((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++	if (s->vincePool && !((uintptr_t)options & kIOSurfaceLockReadOnly) &&
++	    !(((uintptr_t)options & 2) != 0 && vince_lock_fast())) {
+ 		s->vinceCpu = true;             /* what it wrote up to now may sit in the cache */
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 0990ae6..6afa1f2 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -96,6 +96,8 @@ extern "C" void vince_surface_sync(SweetSurface *surface);
+ extern "C" void vince_surface_scan(SweetSurface *surface);
+ /* A program locked or unlocked a surface of the pool (counts for vineflushstats=1). */
+ extern "C" void vince_surface_lock_note(bool unlock, bool write);
++/* vincelockfast=1: a lock with kIOSurfaceLockAvoidSync (2) neither waits for the GPU nor cleans the cache. */
++extern "C" bool vince_lock_fast(void);
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index 7e82945..0bb77d4 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -727,6 +727,25 @@ vince_surface_scan(SweetSurface *s)
+ 	}
+ }
+ 
++/*
++ * vincelockfast=1: IOSurfaceLock/Unlock with kIOSurfaceLockAvoidSync (2) is a program saying that it does not look
++ * at the memory (libtopaz-gl locks and unlocks a surface it drew into only so that the seed moves, about three times a
++ * frame: the statistics of vineflushstats=1 show ~35 locks for write a second and each of them waited for the GPU and
++ * cleaned the whole 11 MB). Such a lock does no sync and does not say that a program may have written. Without the
++ * boot-arg the option is ignored, as before.
++ */
++bool
++vince_lock_fast(void)
++{
++	static int mode = -1;
++
++	if (mode < 0) {
++		uint32_t v = 0;
++		mode = (PE_parse_boot_argn("vincelockfast", &v, sizeof(v)) && v) ? 1 : 0;
++	}
++	return mode == 1;
++}
++
+ /* A program locked or unlocked a surface of the pool (IOSurfaceLock/Unlock); counts for vineflushstats=1. */
+ void
+ vince_surface_lock_note(bool unlock, bool write)
+-- 
+2.43.0
+
