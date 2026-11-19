@@ -332,6 +332,10 @@ static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* topaz: time spent in each entry */
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
+#ifndef kIOSurfaceLockAvoidSync
+#define kIOSurfaceLockAvoidSync 2       /* (IOSurfaceTypes.h) */
+#endif
+
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
@@ -869,15 +873,16 @@ target_to_surface(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		if (IOSurfaceLock(surface, kIOSurfaceLockAvoidSync, NULL) == 0) {
+			IOSurfaceUnlock(surface, kIOSurfaceLockAvoidSync, NULL);
 		}
 		return;
 	}
 	if (image->shared) {
-		/* whoever looks at the surface's seed is to see that it has changed */
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		/* whoever looks at the surface's seed is to see that it has changed (nothing is read or written here, so the
+		 * kernel is told not to wait for the GPU and not to clean the cache: vincelockfast=1) */
+		if (IOSurfaceLock(surface, kIOSurfaceLockAvoidSync, NULL) == 0) {
+			IOSurfaceUnlock(surface, kIOSurfaceLockAvoidSync, NULL);
 		}
 		return;
 	}
