@@ -1,0 +1,51 @@
+From a73c954ed20aa237cc8178959bdc956a29ec0f69 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 19 Nov 2026 23:29:45 +0000
+Subject: [PATCH] 1031 vince: vinceexit=1 logs how fairplayd and the data
+ migrator end, and every process killed by a signal
+
+vinceexit=1 prints one VEXIT line (process, pid, wait status, signal or exit code) when a process exits.
+It covers every process whose name starts with fairplayd, migrationplugin or com.apple.datami, plus any process that dies from a signal. At most 600 lines.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ bsd/kern/kern_exit.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index fde499c..ea0e1d2 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2152,6 +2152,28 @@ proc_exit(proc_t p)
+ 	proc_unlock(p);
+ 	pid = proc_getpid(p);
+ 	exitval = p->p_xstat;
++	{
++		/* vinceexit=1: say how migration/fairplay and every killed process ended. */
++		static int vince_exit_mode = -1;
++		static int vince_exit_left = 600;
++		if (vince_exit_mode < 0) {
++			uint32_t v = 0;
++			if (!PE_parse_boot_argn("vinceexit", &v, sizeof(v))) {
++				v = 0;
++			}
++			vince_exit_mode = v ? 1 : 0;
++		}
++		if (vince_exit_mode && vince_exit_left > 0) {
++			const char *nm = p->p_name;
++			bool sig = (exitval & 0x7f) != 0;
++			bool mig = strncmp(nm, "com.apple.datami", 16) == 0 || strncmp(nm, "migrationplugin", 15) == 0 || strncmp(nm, "fairplayd", 9) == 0;
++			if (sig || mig) {
++				vince_exit_left--;
++				printf("VEXIT %s[%d]: status 0x%x (%s %d)\n", nm, pid,
++				    exitval, sig ? "signal" : "exit code", sig ? (exitval & 0x7f) : ((exitval >> 8) & 0xff));
++			}
++		}
++	}
+ 	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_COMMON,
+ 	    BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT) | DBG_FUNC_START,
+ 	    pid, exitval, 0, 0, 0);
+-- 
+2.43.0
+
