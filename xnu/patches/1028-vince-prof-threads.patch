@@ -1,0 +1,132 @@
+From e11959faed87a90f6d43010860cc7626bc11a093 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 19 Nov 2026 00:14:46 +0000
+Subject: [PATCH] 1028 vince: vinceprof=1 also shows the busiest threads of
+ each watched process
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ osfmk/kern/exception.c | 89 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index e6fd809..01eadde 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1127,9 +1127,22 @@ struct vprof_ent {
+ 	uint32_t n;
+ };
+ 
++/*
++ * The threads of a watched task that were running when sampled, per CPU: how many samples in user mode and in the
++ * kernel, and the priority they had. A process whose one thread runs most of the time (the main thread of
++ * SpringBoard, say) shows as a high share of one core here, however idle the 8 cores are together.
++ */
++#define VPROF_THREADS   24
++struct vprof_thr {
++	uint64_t tid;                   /* 0 = empty */
++	uint32_t user, kern;
++	int16_t pri;
++};
++
+ static struct vprof_cpu {
+ 	uint64_t idle, other, nostate, dropped;
+ 	uint64_t user[VPROF_TARGETS], kern[VPROF_TARGETS];
++	struct vprof_thr thr[VPROF_TARGETS][VPROF_THREADS];
+ 	struct vprof_ent tab[VPROF_SLOTS];
+ } vprof_cpu[VPROF_CPUS];
+ 
+@@ -1210,6 +1223,26 @@ vprof_cb(__unused void *param)
+ 		c->nostate++;
+ 		return;
+ 	}
++	{
++		uint64_t tid = thread_tid(th);
++		struct vprof_thr *e = NULL;
++
++		for (int i = 0; i < VPROF_THREADS; i++) {
++			if (c->thr[t][i].tid == tid || c->thr[t][i].tid == 0) {
++				e = &c->thr[t][i];
++				break;
++			}
++		}
++		if (e != NULL) {
++			e->tid = tid;
++			e->pri = (int16_t)th->sched_pri;
++			if (PSR64_IS_USER(get_saved_state_cpsr(ss))) {
++				e->user++;
++			} else {
++				e->kern++;
++			}
++		}
++	}
+ 	if (PSR64_IS_USER(get_saved_state_cpsr(ss))) {
+ 		c->user[t]++;
+ 		vprof_add(c, VPROF_KEY(t, kVProfUserPc, get_saved_state_pc(ss)));
+@@ -1315,6 +1348,62 @@ vince_prof_report(const char *const *names, int nt, uint32_t secs)
+ 		    user[t] * 100 / total, (user[t] * 1000 / total) % 10, kern[t] * 100 / total, (kern[t] * 1000 / total) % 10,
+ 		    user[t], kern[t]);
+ 	}
++	/* the busiest threads of each watched task: share of ONE core (a thread that is always running is 100%) */
++	for (int t = 0; t < nt && t < VPROF_TARGETS; t++) {
++		uint64_t per_core = total / VPROF_CPUS;     /* samples one core gets in the window */
++		uint64_t shown[6] = { 0 };
++
++		if (per_core == 0) {
++			per_core = 1;
++		}
++		for (int k = 0; k < 6; k++) {
++			uint64_t best = 0, bestuser = 0, bestkern = 0, besttid = 0;
++			int bestpri = 0;
++
++			for (int cpu = 0; cpu < VPROF_CPUS; cpu++) {
++				for (int i = 0; i < VPROF_THREADS; i++) {
++					struct vprof_thr *e = &vprof_cpu[cpu].thr[t][i];
++					uint64_t tid = e->tid, sum = 0, u = 0, kk = 0;
++					bool done = false;
++
++					if (tid == 0) {
++						break;
++					}
++					for (int j = 0; j < k; j++) {
++						if (shown[j] == tid) {
++							done = true;
++						}
++					}
++					if (done) {
++						continue;
++					}
++					for (int c2 = 0; c2 < VPROF_CPUS; c2++) {
++						for (int j = 0; j < VPROF_THREADS; j++) {
++							struct vprof_thr *f = &vprof_cpu[c2].thr[t][j];
++							if (f->tid == tid) {
++								u += f->user;
++								kk += f->kern;
++							}
++						}
++					}
++					sum = u + kk;
++					if (sum > best) {
++						best = sum;
++						bestuser = u;
++						bestkern = kk;
++						besttid = tid;
++						bestpri = e->pri;
++					}
++				}
++			}
++			if (best == 0) {
++				break;
++			}
++			shown[k] = besttid;
++			printf("VPROF %s thread 0x%llx: %llu%% of one core (user %llu, kernel %llu samples), priority %d\n", names[t],
++			    besttid, best * 100 / per_core, bestuser, bestkern, bestpri);
++		}
++	}
+ 	for (int t = 0; t < nt && t < VPROF_TARGETS; t++) {
+ 		for (int kind = 0; kind < 3; kind++) {
+ 			uint64_t base = kind == kVProfKernPc ? kern[t] : user[t];
+-- 
+2.43.0
+
