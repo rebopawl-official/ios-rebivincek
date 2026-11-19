@@ -1,0 +1,148 @@
+From 1e6956546c89b96683b0641cb23f657154356106 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Thu, 19 Nov 2026 23:20:55 +0000
+Subject: [PATCH] 1030 vince: vinceprof=1 also shows what the busiest threads
+ wait for when they do not run
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ osfmk/kern/exception.c | 101 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 101 insertions(+)
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 01eadde..647d44f 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1272,6 +1272,97 @@ vince_prof_task(int slot, task_t task)
+ 	}
+ }
+ 
++/*
++ * What the threads of the watched tasks are doing, running or not: every tick (5 ms) the threads of each watched task
++ * are read, and each is counted as running on a CPU, runnable and waiting for one, or waiting, by what the thread last
++ * blocked on (block_hint: a port to receive from, a pthread mutex, a condition variable ...). The IPI samples above
++ * see only a thread that runs; this is the rest of its time. Read without the thread's lock (diagnostics): a wrong
++ * count now and then does not matter.
++ */
++#define VST_BUCKETS 24
++static const char *const vst_names[VST_BUCKETS] = {
++	"running", "runnable", "waiting (no hint)", "kernel mutex", "port receive", "port set receive", "port send",
++	"port send in transit", "semaphore", "kernel rwlock read", "kernel rwlock write", "kernel rwlock upgrade",
++	"user lock", "pthread mutex", "pthread rwlock read", "pthread rwlock write", "pthread condvar", "parked workqueue",
++	"workloop sync wait", "wait on process", "sleep with inheritor", "eventlink", "compressor", "other"
++};
++static struct vprof_st {
++	uint64_t tid;
++	uint32_t n[VST_BUCKETS];
++} vprof_st[VPROF_TARGETS][VPROF_THREADS];
++
++static void
++vprof_states(void)
++{
++	for (int t = 0; t < VPROF_TARGETS; t++) {
++		task_t task = vprof_task[t];
++		thread_t th;
++
++		if (task == TASK_NULL) {
++			continue;
++		}
++		task_lock(task);
++		queue_iterate(&task->threads, th, thread_t, task_threads) {
++			uint64_t tid = thread_tid(th);
++			uint32_t state = th->state;
++			struct vprof_st *e = NULL;
++			int b;
++
++			for (int i = 0; i < VPROF_THREADS; i++) {
++				if (vprof_st[t][i].tid == tid || vprof_st[t][i].tid == 0) {
++					e = &vprof_st[t][i];
++					break;
++				}
++			}
++			if (e == NULL) {
++				continue;
++			}
++			e->tid = tid;
++			if (state & TH_RUN) {
++				b = th->runq != PROCESSOR_NULL ? 1 : 0;
++			} else if (state & TH_WAIT) {
++				uint32_t h = (uint32_t)th->block_hint;
++				b = h <= 0x14 ? (int)(2 + h) : 23;
++			} else {
++				b = 23;
++			}
++			e->n[b]++;
++		}
++		task_unlock(task);
++	}
++}
++
++/* the line of states of a thread, for the report: "running 35%, port receive 40%, ..." (steps of 2% and more) */
++static void
++vprof_state_line(int t, uint64_t tid, char *out, size_t size)
++{
++	size_t used = 0;
++	uint64_t total = 0;
++	struct vprof_st *e = NULL;
++
++	out[0] = 0;
++	for (int i = 0; i < VPROF_THREADS; i++) {
++		if (vprof_st[t][i].tid == tid) {
++			e = &vprof_st[t][i];
++		}
++	}
++	if (e == NULL) {
++		return;
++	}
++	for (int b = 0; b < VST_BUCKETS; b++) {
++		total += e->n[b];
++	}
++	if (total == 0) {
++		return;
++	}
++	for (int b = 0; b < VST_BUCKETS; b++) {
++		if (e->n[b] * 100 / total >= 2 && used < size - 40) {
++			used += (size_t)snprintf(out + used, size - used, "%s%s %llu%%", used ? ", " : "", vst_names[b],
++			    (unsigned long long)(e->n[b] * 100 / total));
++		}
++	}
++}
++
+ /* one round of samples: every other CPU that is running gets an IPI */
+ void
+ vince_prof_tick(void)
+@@ -1288,6 +1379,7 @@ vince_prof_tick(void)
+ 		}
+ 		(void)cpu_xcall(cpu, vprof_cb, &dummy);
+ 	}
++	vprof_states();
+ }
+ 
+ static uint64_t
+@@ -1402,6 +1494,14 @@ vince_prof_report(const char *const *names, int nt, uint32_t secs)
+ 			shown[k] = besttid;
+ 			printf("VPROF %s thread 0x%llx: %llu%% of one core (user %llu, kernel %llu samples), priority %d\n", names[t],
+ 			    besttid, best * 100 / per_core, bestuser, bestkern, bestpri);
++			{
++				char st[200];
++
++				vprof_state_line(t, besttid, st, sizeof(st));
++				if (st[0] != 0) {
++					printf("VPROF %s thread 0x%llx states: %s\n", names[t], besttid, st);
++				}
++			}
+ 		}
+ 	}
+ 	for (int t = 0; t < nt && t < VPROF_TARGETS; t++) {
+@@ -1448,6 +1548,7 @@ vince_prof_report(const char *const *names, int nt, uint32_t secs)
+ 		}
+ 	}
+ 	bzero(vprof_cpu, sizeof(vprof_cpu));
++	bzero(vprof_st, sizeof(vprof_st));
+ }
+ 
+ 
+-- 
+2.43.0
+
