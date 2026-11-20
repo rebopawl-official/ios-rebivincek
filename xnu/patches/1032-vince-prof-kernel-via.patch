@@ -1,0 +1,121 @@
+From 9bc97d9998aecc0b4adcb5b40da6eb622c4c70a1 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Fri, 20 Nov 2026 05:36:54 +0000
+Subject: [PATCH] 1032 vince: vinceprof=1 also shows which system calls and
+ faults the kernel time of the busiest threads goes into
+
+For every kernel sample of a watched process, vinceprof=1 walks the frame-pointer chain of the thread's kernel stack and counts the callers nearest to the exception entry (depth 1 = what the exception handler called, 2 = the dispatcher, 3 = the system call, Mach trap or fault handler itself). The report adds 'kernel via depth N' lines with unslid addresses to resolve with sym.py.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ osfmk/kern/exception.c | 51 +++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 647d44f..b6dc295 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -91,6 +91,7 @@
+ 
+ #include <security/mac_mach_internal.h>
+ #include <string.h>
++#include <mach/vm_param.h>
+ 
+ #include <pexpert/pexpert.h>
+ 
+@@ -1148,7 +1149,7 @@ static struct vprof_cpu {
+ 
+ static task_t vprof_task[VPROF_TARGETS];
+ 
+-enum { kVProfUserPc = 0, kVProfUserLr = 1, kVProfKernPc = 2 };
++enum { kVProfUserPc = 0, kVProfUserLr = 1, kVProfKernPc = 2, kVProfKernVia = 3 };
+ 
+ #define VPROF_KEY(t, kind, pc)  (((uint64_t)(pc) & 0xffffffffffffULL) | ((uint64_t)(kind) << 48) | ((uint64_t)(t) << 50) | (1ULL << 52))
+ #define VPROF_KIND(key)         ((unsigned)(((key) >> 48) & 3))
+@@ -1190,6 +1191,40 @@ vprof_add(struct vprof_cpu *c, uint64_t key)
+ 	}
+ }
+ 
++/*
++ * The kernel was running for a watched thread: walk its frame-pointer chain up the thread's kernel stack and note
++ * the callers nearest to the exception entry. Depth 1 is what the exception handler called, 2 the dispatcher of
++ * system calls or faults, 3 the call itself (a system call, a Mach trap, a fault handler). Leaf functions have no
++ * frame of their own, so the chain starts with the caller of the interrupted function.
++ */
++static void
++vprof_via(struct vprof_cpu *c, int t, thread_t th, arm_saved_state_t *ss)
++{
++	uint64_t frames[40];
++	int n = 0;
++	uint64_t fp = (uint64_t)get_saved_state_fp(ss);
++	uint64_t lo = (uint64_t)th->kernel_stack, hi = lo + KERNEL_STACK_SIZE;
++
++	if (lo == 0) {
++		return;
++	}
++	while (n < 40 && (fp & 15) == 0 && fp >= lo && fp + 16 <= hi) {
++		uint64_t next = *(uint64_t *)fp, lr = *(uint64_t *)(fp + 8);
++
++		frames[n++] = lr;
++		if (next <= fp) {
++			break;
++		}
++		fp = next;
++	}
++	for (int d = 1; d <= 3; d++) {
++		if (n - 1 - d >= 0) {
++			uint64_t a = (uint64_t)VM_KERNEL_UNSLIDE(frames[n - 1 - d]);
++			vprof_add(c, VPROF_KEY(t, kVProfKernVia, ((uint64_t)d << 32) | (a & 0xffffffffULL)));
++		}
++	}
++}
++
+ /* runs on the CPU that is sampled, in the interrupt of the IPI */
+ static void
+ vprof_cb(__unused void *param)
+@@ -1250,6 +1285,7 @@ vprof_cb(__unused void *param)
+ 	} else {
+ 		c->kern[t]++;
+ 		vprof_add(c, VPROF_KEY(t, kVProfKernPc, get_saved_state_pc(ss)));
++		vprof_via(c, t, th, ss);
+ 	}
+ }
+ 
+@@ -1410,7 +1446,7 @@ vprof_clear(uint64_t key)
+ void
+ vince_prof_report(const char *const *names, int nt, uint32_t secs)
+ {
+-	static const char *const kinds[] = { "user pc", "user lr", "kernel pc" };
++	static const char *const kinds[] = { "user pc", "user lr", "kernel pc", "kernel via" };
+ 	uint64_t idle = 0, other = 0, nostate = 0, dropped = 0, total;
+ 	uint64_t user[VPROF_TARGETS] = { 0 }, kern[VPROF_TARGETS] = { 0 };
+ 
+@@ -1505,8 +1541,8 @@ vince_prof_report(const char *const *names, int nt, uint32_t secs)
+ 		}
+ 	}
+ 	for (int t = 0; t < nt && t < VPROF_TARGETS; t++) {
+-		for (int kind = 0; kind < 3; kind++) {
+-			uint64_t base = kind == kVProfKernPc ? kern[t] : user[t];
++		for (int kind = 0; kind < 4; kind++) {
++			uint64_t base = kind >= kVProfKernPc ? kern[t] : user[t];
+ 
+ 			if (base == 0) {
+ 				continue;
+@@ -1534,7 +1570,12 @@ vince_prof_report(const char *const *names, int nt, uint32_t secs)
+ 					break;
+ 				}
+ 				pc = bestkey & 0xffffffffffffULL;
+-				if (kind == kVProfKernPc) {
++				if (kind == kVProfKernVia) {
++					uint64_t a = 0xfffffff000000000ULL | (pc & 0xffffffffULL);
++
++					printf("VPROF %s kernel via depth %u 0x%llx %llu.%llu%%\n", names[t], (unsigned)((pc >> 32) & 0xff),
++					    a, best * 100 / base, (best * 1000 / base) % 10);
++				} else if (kind == kVProfKernPc) {
+ 					pc |= 0xffff000000000000ULL;
+ 					printf("VPROF %s %s 0x%llx (unslid 0x%llx) %llu.%llu%%\n", names[t], kinds[kind], pc,
+ 					    (uint64_t)VM_KERNEL_UNSLIDE(pc), best * 100 / base, (best * 1000 / base) % 10);
+-- 
+2.43.0
+
